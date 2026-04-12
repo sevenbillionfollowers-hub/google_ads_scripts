@@ -17,15 +17,17 @@ var SEARCH_TERM_HEADERS = [
   'conversions', 'conversion_value'
 ];
 
-function runReports() {
+function getSheetUrl() {
   if (SHEET_URL.indexOf('REPLACE_ME') !== -1) {
     throw new Error(
       'SHEET_URL is not configured — edit main.js in the hosting repo ' +
       'and replace REPLACE_ME with the target Google Sheet URL.'
     );
   }
+  return SHEET_URL;
+}
 
-  var ss = SpreadsheetApp.openByUrl(SHEET_URL);
+function runReports(ss) {
   var account = AdsApp.currentAccount();
   var ctx = {
     accountId:    account.getCustomerId(),
