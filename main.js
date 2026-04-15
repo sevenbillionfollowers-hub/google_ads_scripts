@@ -56,9 +56,9 @@ function fetchCampaignFinalUrls() {
       'campaign.id, ' +
       'ad_group_ad.ad.final_urls ' +
     'FROM ad_group_ad ' +
-    "WHERE ad_group_ad.status IN ('ENABLED', 'PAUSED') " +
-      "AND ad_group.status IN ('ENABLED', 'PAUSED') " +
-      "AND campaign.status IN ('ENABLED', 'PAUSED')";
+    "WHERE ad_group_ad.status IN ('ENABLED', 'PAUSED', 'REMOVED') " +
+      "AND ad_group.status IN ('ENABLED', 'PAUSED', 'REMOVED') " +
+      "AND campaign.status IN ('ENABLED', 'PAUSED', 'REMOVED')";
 
   var iter = AdsApp.search(query);
   while (iter.hasNext()) {
