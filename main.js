@@ -12,7 +12,7 @@ var CAMPAIGN_HEADERS = [
 
 var SEARCH_TERM_HEADERS = [
   'date', 'account_name', 'account_id', 'campaign_id', 'campaign_name',
-  'ad_group_name', 'search_term',
+  'ad_group_name', 'keyword', 'search_term',
   'impressions', 'clicks', 'cost', 'ctr', 'avg_cpc',
   'conversions', 'conversion_value'
 ];
@@ -141,6 +141,7 @@ function writeSearchTerms(ss, ctx) {
       'campaign.name, ' +
       'ad_group.id, ' +
       'ad_group.name, ' +
+      'segments.keyword.info.text, ' +
       'search_term_view.search_term, ' +
       'metrics.impressions, ' +
       'metrics.clicks, ' +
@@ -159,6 +160,9 @@ function writeSearchTerms(ss, ctx) {
     var cost   = Number(r.metrics.costMicros || 0) / 1e6;
     var avgCpc = Number(r.metrics.averageCpc || 0) / 1e6;
 
+    var keywordText =
+      (r.segments && r.segments.keyword && r.segments.keyword.info && r.segments.keyword.info.text) || '';
+
     rows.push([
       r.segments.date,
       ctx.accountName,
@@ -166,6 +170,7 @@ function writeSearchTerms(ss, ctx) {
       r.campaign.id,
       r.campaign.name,
       r.adGroup.name,
+      keywordText,
       r.searchTermView.searchTerm,
       Number(r.metrics.impressions || 0),
       Number(r.metrics.clicks || 0),
