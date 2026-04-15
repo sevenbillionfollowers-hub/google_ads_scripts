@@ -7,7 +7,8 @@ var CAMPAIGN_HEADERS = [
   'date', 'account_name', 'account_id', 'campaign_id', 'campaign_name',
   'status', 'channel_type', 'final_url',
   'impressions', 'clicks', 'cost', 'ctr', 'avg_cpc',
-  'conversions', 'conversion_value', 'cpa', 'roas'
+  'conversions', 'conversion_value', 'cpa', 'roas',
+  'currency_code'
 ];
 
 var CAMPAIGN_KEY_COLS = ['account_id', 'campaign_id', 'date'];
@@ -16,7 +17,8 @@ var SEARCH_TERM_HEADERS = [
   'date', 'account_name', 'account_id', 'campaign_id', 'campaign_name',
   'ad_group_name', 'keyword', 'search_term',
   'impressions', 'clicks', 'cost', 'ctr', 'avg_cpc',
-  'conversions', 'conversion_value'
+  'conversions', 'conversion_value',
+  'currency_code'
 ];
 
 var SEARCH_TERM_KEY_COLS = ['account_id', 'campaign_id', 'ad_group_name', 'keyword', 'search_term', 'date'];
@@ -36,6 +38,7 @@ function runReports(ss) {
   var ctx = {
     accountId:    account.getCustomerId(),
     accountName:  account.getName(),
+    currencyCode: account.getCurrencyCode(),
     timezone:     account.getTimeZone(),
     dateRange:    computeDateRange(DATE_WINDOW_DAYS, account.getTimeZone()),
     campaignUrls: fetchCampaignFinalUrls()
@@ -43,6 +46,7 @@ function runReports(ss) {
 
   Logger.log(
     'runReports → ' + ctx.accountName + ' (' + ctx.accountId + ') ' +
+    'currency=' + ctx.currencyCode + ' ' +
     'tz=' + ctx.timezone + ' ' +
     'window=' + ctx.dateRange.start + '..' + ctx.dateRange.end
   );
@@ -148,7 +152,8 @@ function writeCampaigns(ss, ctx) {
       conversions,
       conversionValue,
       cpa,
-      roas
+      roas,
+      ctx.currencyCode
     ]);
   }
 
@@ -204,7 +209,8 @@ function writeSearchTerms(ss, ctx) {
       Number(r.metrics.ctr || 0),
       avgCpc,
       Number(r.metrics.conversions || 0),
-      Number(r.metrics.conversionsValue || 0)
+      Number(r.metrics.conversionsValue || 0),
+      ctx.currencyCode
     ]);
   }
 
@@ -222,8 +228,12 @@ function ensureHeaders(sheet, headers) {
     return;
   }
 
-  var currentHeader = sheet.getRange(1, 1, 1, headers.length).getValues()[0];
-  for (var h = 0; h < headers.length; h++) {
+  var existingCount = sheet.getLastColumn();
+  var overlap = Math.min(existingCount, headers.length);
+  var currentHeader = sheet.getRange(1, 1, 1, overlap).getValues()[0];
+
+  // Existing prefix must match exactly — catches actual corruption.
+  for (var h = 0; h < overlap; h++) {
     if (String(currentHeader[h]) !== headers[h]) {
       throw new Error(
         'Header mismatch on tab "' + sheet.getName() + '" col ' + (h + 1) +
@@ -231,6 +241,14 @@ function ensureHeaders(sheet, headers) {
         'Delete the tab and re-run to regenerate it.'
       );
     }
+  }
+
+  // We've added trailing columns to the expected header — extend the sheet
+  // in place so existing rows are preserved; blanks fill the new cells
+  // until downstream rewrites them.
+  if (headers.length > existingCount) {
+    var extra = headers.slice(existingCount);
+    sheet.getRange(1, existingCount + 1, 1, extra.length).setValues([extra]);
   }
 }
 
