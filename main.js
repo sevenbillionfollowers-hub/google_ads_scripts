@@ -10,12 +10,16 @@ var CAMPAIGN_HEADERS = [
   'conversions', 'conversion_value', 'cpa', 'roas'
 ];
 
+var CAMPAIGN_KEY_COLS = ['account_id', 'campaign_id', 'date'];
+
 var SEARCH_TERM_HEADERS = [
   'date', 'account_name', 'account_id', 'campaign_id', 'campaign_name',
   'ad_group_name', 'keyword', 'search_term',
   'impressions', 'clicks', 'cost', 'ctr', 'avg_cpc',
   'conversions', 'conversion_value'
 ];
+
+var SEARCH_TERM_KEY_COLS = ['account_id', 'campaign_id', 'ad_group_name', 'keyword', 'search_term', 'date'];
 
 function getSheetUrl() {
   if (SHEET_URL.indexOf('REPLACE_ME') !== -1) {
@@ -50,16 +54,38 @@ function runReports(ss) {
 }
 
 function fetchCampaignFinalUrls() {
+  // Prefer ENABLED active ads for URL attribution. Falling back to PAUSED only
+  // when no ENABLED ad exists avoids a REMOVED ad's URL overwriting a live one.
+  var enabledUrls = collectFinalUrls(
+    "WHERE ad_group_ad.status = 'ENABLED' " +
+      "AND ad_group.status = 'ENABLED' " +
+      "AND campaign.status = 'ENABLED'"
+  );
+  var pausedUrls = collectFinalUrls(
+    "WHERE ad_group_ad.status IN ('ENABLED', 'PAUSED') " +
+      "AND ad_group.status IN ('ENABLED', 'PAUSED') " +
+      "AND campaign.status IN ('ENABLED', 'PAUSED')"
+  );
+
   var urls = {};
+  for (var cid in pausedUrls) if (pausedUrls.hasOwnProperty(cid)) urls[cid] = pausedUrls[cid];
+  for (var cid2 in enabledUrls) if (enabledUrls.hasOwnProperty(cid2)) urls[cid2] = enabledUrls[cid2];
+  return urls;
+}
+
+function collectFinalUrls(whereClause) {
+  // Sort so we always pick the smallest ad id per campaign → deterministic
+  // URL attribution across runs even when a campaign has multiple ads.
   var query =
     'SELECT ' +
       'campaign.id, ' +
+      'ad_group_ad.ad.id, ' +
       'ad_group_ad.ad.final_urls ' +
     'FROM ad_group_ad ' +
-    "WHERE ad_group_ad.status IN ('ENABLED', 'PAUSED', 'REMOVED') " +
-      "AND ad_group.status IN ('ENABLED', 'PAUSED', 'REMOVED') " +
-      "AND campaign.status IN ('ENABLED', 'PAUSED', 'REMOVED')";
+    whereClause + ' ' +
+    'ORDER BY campaign.id, ad_group_ad.ad.id';
 
+  var urls = {};
   var iter = AdsApp.search(query);
   while (iter.hasNext()) {
     var r = iter.next();
@@ -127,7 +153,7 @@ function writeCampaigns(ss, ctx) {
   }
 
   Logger.log('Campaigns rows collected: ' + rows.length);
-  upsertRows(sheet, CAMPAIGN_HEADERS, rows, ctx.accountId, ctx.dateRange);
+  upsertRows(sheet, CAMPAIGN_HEADERS, CAMPAIGN_KEY_COLS, rows, ctx.accountId, ctx.dateRange);
 }
 
 function writeSearchTerms(ss, ctx) {
@@ -183,7 +209,7 @@ function writeSearchTerms(ss, ctx) {
   }
 
   Logger.log('Search-term rows collected: ' + rows.length);
-  upsertRows(sheet, SEARCH_TERM_HEADERS, rows, ctx.accountId, ctx.dateRange);
+  upsertRows(sheet, SEARCH_TERM_HEADERS, SEARCH_TERM_KEY_COLS, rows, ctx.accountId, ctx.dateRange);
 }
 
 function ensureHeaders(sheet, headers) {
@@ -208,32 +234,52 @@ function ensureHeaders(sheet, headers) {
   }
 }
 
-function upsertRows(sheet, headers, newRows, accountId, dateRange) {
+function upsertRows(sheet, headers, keyCols, newRows, accountId, dateRange) {
   var dateCol = headers.indexOf('date');
   var acctCol = headers.indexOf('account_id');
   if (dateCol < 0 || acctCol < 0) {
     throw new Error('upsertRows: headers must include date + account_id');
   }
 
+  var keyIdx = [];
+  for (var kc = 0; kc < keyCols.length; kc++) {
+    var idx = headers.indexOf(keyCols[kc]);
+    if (idx < 0) throw new Error('upsertRows: unknown key column ' + keyCols[kc]);
+    keyIdx.push(idx);
+  }
+
   var sheetTz = sheet.getParent().getSpreadsheetTimeZone();
   var lastRow = sheet.getLastRow();
-  var keepRows = [];
 
+  // Normalize incoming dates before key comparison so string keys match.
+  for (var j = 0; j < newRows.length; j++) {
+    newRows[j][dateCol] = toDateStr(newRows[j][dateCol], sheetTz);
+  }
+
+  // Build set of unique keys from newRows so we only replace rows that were
+  // re-fetched this run. In-window rows absent from the new batch (e.g. a
+  // campaign that had zero impressions today and is omitted by GAQL) are
+  // preserved — otherwise history silently disappears.
+  var newKeys = {};
+  for (var n = 0; n < newRows.length; n++) {
+    newKeys[makeKey(newRows[n], keyIdx)] = true;
+  }
+
+  var keepRows = [];
   if (lastRow > 1) {
     var existing = sheet.getRange(2, 1, lastRow - 1, headers.length).getValues();
     for (var i = 0; i < existing.length; i++) {
       var row = existing[i];
-      var sameAccount = String(row[acctCol]) === String(accountId);
-      var rowDate = toDateStr(row[dateCol], sheetTz);
-      var inWindow = rowDate >= dateRange.start && rowDate <= dateRange.end;
-      if (!(sameAccount && inWindow)) {
-        keepRows.push(row);
-      }
-    }
-  }
+      // Normalize date on existing row too so key comparison is apples-to-apples.
+      row[dateCol] = toDateStr(row[dateCol], sheetTz);
 
-  for (var j = 0; j < newRows.length; j++) {
-    newRows[j][dateCol] = toDateStr(newRows[j][dateCol], sheetTz);
+      var sameAccount = String(row[acctCol]) === String(accountId);
+      var inWindow = row[dateCol] >= dateRange.start && row[dateCol] <= dateRange.end;
+      if (sameAccount && inWindow && newKeys[makeKey(row, keyIdx)]) {
+        continue; // will be replaced by newRows
+      }
+      keepRows.push(row);
+    }
   }
 
   var finalRows = keepRows.concat(newRows);
@@ -244,6 +290,14 @@ function upsertRows(sheet, headers, newRows, accountId, dateRange) {
   if (finalRows.length > 0) {
     sheet.getRange(2, 1, finalRows.length, headers.length).setValues(finalRows);
   }
+}
+
+function makeKey(row, keyIdx) {
+  var parts = [];
+  for (var i = 0; i < keyIdx.length; i++) {
+    parts.push(String(row[keyIdx[i]]));
+  }
+  return parts.join('\u241F'); // SYMBOL FOR UNIT SEPARATOR — won't appear in any real field
 }
 
 function toDateStr(v, tz) {
