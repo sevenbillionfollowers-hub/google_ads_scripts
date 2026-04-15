@@ -1,5 +1,5 @@
 var SHEET_URL        = 'https://docs.google.com/spreadsheets/d/108CnrRFLlMxmrS-9PQwUN1-JypODUkin3c_0UXlTV2o/edit';
-var DATE_WINDOW_DAYS = 2;
+var DATE_WINDOW_DAYS = 3;
 var CAMPAIGNS_TAB    = 'Campaigns';
 var SEARCH_TERMS_TAB = 'SearchTerms';
 
@@ -255,7 +255,7 @@ function toDateStr(v, tz) {
 
 function computeDateRange(days, tz) {
   var todayStr = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
-  var endDate   = addDays(todayStr, -1);
+  var endDate   = todayStr;
   var startDate = addDays(endDate, -(days - 1));
   return { start: startDate, end: endDate };
 }
