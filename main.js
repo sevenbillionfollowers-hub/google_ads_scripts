@@ -8,7 +8,8 @@ var CAMPAIGN_HEADERS = [
   'status', 'channel_type', 'final_url',
   'impressions', 'clicks', 'cost', 'ctr', 'avg_cpc',
   'conversions', 'conversion_value', 'cpa', 'roas',
-  'currency_code'
+  'currency_code',
+  'primary_status', 'primary_status_reasons'
 ];
 
 var CAMPAIGN_KEY_COLS = ['account_id', 'campaign_id', 'date'];
@@ -113,6 +114,8 @@ function writeCampaigns(ss, ctx) {
       'campaign.id, ' +
       'campaign.name, ' +
       'campaign.status, ' +
+      'campaign.primary_status, ' +
+      'campaign.primary_status_reasons, ' +
       'campaign.advertising_channel_type, ' +
       'metrics.impressions, ' +
       'metrics.clicks, ' +
@@ -153,7 +156,9 @@ function writeCampaigns(ss, ctx) {
       conversionValue,
       cpa,
       roas,
-      ctx.currencyCode
+      ctx.currencyCode,
+      r.campaign.primaryStatus || '',
+      JSON.stringify(r.campaign.primaryStatusReasons || [])
     ]);
   }
 
