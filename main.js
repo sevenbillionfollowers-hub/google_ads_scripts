@@ -9,7 +9,8 @@ var CAMPAIGN_HEADERS = [
   'impressions', 'clicks', 'cost', 'ctr', 'avg_cpc',
   'conversions', 'conversion_value', 'cpa', 'roas',
   'currency_code',
-  'primary_status', 'primary_status_reasons'
+  'primary_status', 'primary_status_reasons',
+  'last_updated'
 ];
 
 var CAMPAIGN_KEY_COLS = ['account_id', 'campaign_id', 'date'];
@@ -19,7 +20,8 @@ var SEARCH_TERM_HEADERS = [
   'ad_group_name', 'keyword', 'search_term',
   'impressions', 'clicks', 'cost', 'ctr', 'avg_cpc',
   'conversions', 'conversion_value',
-  'currency_code'
+  'currency_code',
+  'last_updated'
 ];
 
 var SEARCH_TERM_KEY_COLS = ['account_id', 'campaign_id', 'ad_group_name', 'keyword', 'search_term', 'date'];
@@ -36,13 +38,18 @@ function getSheetUrl() {
 
 function runReports(ss) {
   var account = AdsApp.currentAccount();
+  // One ISO8601 timestamp per runReports() call — every row written this run
+  // gets the same `last_updated` value, so Laravel can trust the column to
+  // reflect "when did the Ads Script actually run", not "when did the Sheet
+  // row last get upserted" (the Laravel command stamps its own column too).
   var ctx = {
     accountId:    account.getCustomerId(),
     accountName:  account.getName(),
     currencyCode: account.getCurrencyCode(),
     timezone:     account.getTimeZone(),
     dateRange:    computeDateRange(DATE_WINDOW_DAYS, account.getTimeZone()),
-    campaignUrls: fetchCampaignFinalUrls()
+    campaignUrls: fetchCampaignFinalUrls(),
+    runTimestamp: new Date().toISOString()
   };
 
   Logger.log(
@@ -158,7 +165,8 @@ function writeCampaigns(ss, ctx) {
       roas,
       ctx.currencyCode,
       r.campaign.primaryStatus || '',
-      JSON.stringify(r.campaign.primaryStatusReasons || [])
+      JSON.stringify(r.campaign.primaryStatusReasons || []),
+      ctx.runTimestamp
     ]);
   }
 
@@ -215,7 +223,8 @@ function writeSearchTerms(ss, ctx) {
       avgCpc,
       Number(r.metrics.conversions || 0),
       Number(r.metrics.conversionsValue || 0),
-      ctx.currencyCode
+      ctx.currencyCode,
+      ctx.runTimestamp
     ]);
   }
 
