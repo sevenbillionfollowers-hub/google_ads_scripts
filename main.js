@@ -232,13 +232,17 @@ function writeSearchTerms(ss, ctx) {
   upsertRows(sheet, SEARCH_TERM_HEADERS, SEARCH_TERM_KEY_COLS, rows, ctx.accountId, ctx.dateRange);
 }
 
+// Columns whose values are text but happen to look like something Sheets'
+// "Automatic" format would auto-coerce — `date` → Date object, `last_updated`
+// → Date object (ISO8601 with `T`/`Z` is close enough that some locales parse
+// it). Coercion breaks the downstream gviz CSV contract: the Laravel sync
+// expects the raw string we wrote, not a locale-formatted Date readback.
+var TEXT_FORMATTED_COLUMNS = ['date', 'last_updated'];
+
 function ensureHeaders(sheet, headers) {
   if (sheet.getLastRow() === 0) {
     sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-    var dateColIdx = headers.indexOf('date') + 1;
-    if (dateColIdx > 0) {
-      sheet.getRange(2, dateColIdx, sheet.getMaxRows() - 1, 1).setNumberFormat('@');
-    }
+    applyTextFormats(sheet, headers, 0);
     return;
   }
 
@@ -263,6 +267,24 @@ function ensureHeaders(sheet, headers) {
   if (headers.length > existingCount) {
     var extra = headers.slice(existingCount);
     sheet.getRange(1, existingCount + 1, 1, extra.length).setValues([extra]);
+    // Format newly-added text columns before any data is written, otherwise
+    // the first setValues() with an ISO8601 string lands in a cell that's
+    // still "Automatic" and may get coerced to Date before we can reformat.
+    applyTextFormats(sheet, headers, existingCount);
+  }
+}
+
+// Apply `@` (plain text) format to any TEXT_FORMATTED_COLUMNS present at
+// header index >= skipBefore. Also reformats existing data cells so stale
+// Date-object values in a pre-format sheet get preserved as strings on next
+// read rather than coerced at read time.
+function applyTextFormats(sheet, headers, skipBefore) {
+  var maxRows = sheet.getMaxRows();
+  if (maxRows < 2) return;
+  for (var i = 0; i < TEXT_FORMATTED_COLUMNS.length; i++) {
+    var idx = headers.indexOf(TEXT_FORMATTED_COLUMNS[i]);
+    if (idx < 0 || idx < skipBefore) continue;
+    sheet.getRange(2, idx + 1, maxRows - 1, 1).setNumberFormat('@');
   }
 }
 
