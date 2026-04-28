@@ -10,7 +10,8 @@ var CAMPAIGN_HEADERS = [
   'conversions', 'conversion_value', 'cpa', 'roas',
   'currency_code',
   'primary_status', 'primary_status_reasons',
-  'last_updated'
+  'last_updated',
+  'daily_budget', 'target_cpa', 'bidding_strategy_type'
 ];
 
 var CAMPAIGN_KEY_COLS = ['account_id', 'campaign_id', 'date'];
@@ -124,6 +125,10 @@ function writeCampaigns(ss, ctx) {
       'campaign.primary_status, ' +
       'campaign.primary_status_reasons, ' +
       'campaign.advertising_channel_type, ' +
+      'campaign.bidding_strategy_type, ' +
+      'campaign.target_cpa.target_cpa_micros, ' +
+      'campaign.maximize_conversions.target_cpa_micros, ' +
+      'campaign_budget.amount_micros, ' +
       'metrics.impressions, ' +
       'metrics.clicks, ' +
       'metrics.cost_micros, ' +
@@ -144,6 +149,18 @@ function writeCampaigns(ss, ctx) {
     var conversionValue = Number(r.metrics.conversionsValue || 0);
     var cpa  = conversions > 0 ? cost / conversions : 0;
     var roas = cost > 0 ? conversionValue / cost : 0;
+
+    var biddingType = r.campaign.biddingStrategyType || '';
+    if (biddingType === 'UNSPECIFIED' || biddingType === 'UNKNOWN') biddingType = '';
+
+    // TARGET_CPA puts the target on campaign.target_cpa.target_cpa_micros;
+    // MAXIMIZE_CONVERSIONS may carry an optional cap on
+    // campaign.maximize_conversions.target_cpa_micros. Coalesce.
+    var tcpaMicros = (r.campaign.targetCpa && r.campaign.targetCpa.targetCpaMicros) ||
+                     (r.campaign.maximizeConversions && r.campaign.maximizeConversions.targetCpaMicros) || 0;
+    var tcpa = Number(tcpaMicros) > 0 ? Number(tcpaMicros) / 1e6 : '';
+
+    var budget = Number((r.campaignBudget && r.campaignBudget.amountMicros) || 0) / 1e6;
 
     rows.push([
       r.segments.date,
@@ -166,7 +183,10 @@ function writeCampaigns(ss, ctx) {
       ctx.currencyCode,
       r.campaign.primaryStatus || '',
       JSON.stringify(r.campaign.primaryStatusReasons || []),
-      ctx.runTimestamp
+      ctx.runTimestamp,
+      budget,
+      tcpa,
+      biddingType
     ]);
   }
 
