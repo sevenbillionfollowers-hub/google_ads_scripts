@@ -11,7 +11,8 @@ var CAMPAIGN_HEADERS = [
   'currency_code',
   'primary_status', 'primary_status_reasons',
   'last_updated',
-  'daily_budget', 'target_cpa', 'bidding_strategy_type'
+  'daily_budget', 'target_cpa', 'bidding_strategy_type',
+  'account_timezone'
 ];
 
 var CAMPAIGN_KEY_COLS = ['account_id', 'campaign_id', 'date'];
@@ -186,7 +187,8 @@ function writeCampaigns(ss, ctx) {
       ctx.runTimestamp,
       budget,
       tcpa,
-      biddingType
+      biddingType,
+      ctx.timezone
     ]);
   }
 
