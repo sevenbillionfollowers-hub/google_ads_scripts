@@ -1,7 +1,13 @@
-var SHEET_URL        = 'https://docs.google.com/spreadsheets/d/108CnrRFLlMxmrS-9PQwUN1-JypODUkin3c_0UXlTV2o/edit';
-var DATE_WINDOW_DAYS = 3;
-var CAMPAIGNS_TAB    = 'Campaigns';
-var SEARCH_TERMS_TAB = 'SearchTerms';
+var SHEET_URL         = 'https://docs.google.com/spreadsheets/d/108CnrRFLlMxmrS-9PQwUN1-JypODUkin3c_0UXlTV2o/edit';
+var DATE_WINDOW_DAYS  = 3;
+var CAMPAIGNS_TAB     = 'Campaigns';
+var SEARCH_TERMS_TAB  = 'SearchTerms';
+var CHANGE_EVENTS_TAB = 'ChangeEvents';
+
+// change_event.change_date_time → `date` is the YYYY-MM-DD slice so upsertRows'
+// window + account_id gates work unchanged. The Google-side LIMIT is 10000 per
+// query and the WHERE filter is mandatory (the API rejects unbounded scans).
+var CHANGE_EVENT_LIMIT = 10000;
 
 var CAMPAIGN_HEADERS = [
   'date', 'account_name', 'account_id', 'campaign_id', 'campaign_name',
@@ -27,6 +33,23 @@ var SEARCH_TERM_HEADERS = [
 ];
 
 var SEARCH_TERM_KEY_COLS = ['account_id', 'campaign_id', 'ad_group_name', 'keyword', 'search_term', 'date'];
+
+var CHANGE_EVENT_HEADERS = [
+  'date', 'change_date_time', 'account_name', 'account_id',
+  'change_event_resource_name',
+  'change_resource_type', 'resource_change_operation',
+  'changed_resource_name',
+  'campaign_resource_name', 'ad_group_resource_name', 'feed_resource_name',
+  'campaign_id', 'campaign_name',
+  'user_email', 'client_type',
+  'changed_fields_json', 'old_resource_json', 'new_resource_json',
+  'last_updated'
+];
+
+// (account_id, change_event_resource_name) is globally unique — Google's event
+// resource_name embeds `{date_time}~{order}`. Including `date` keeps the
+// upsertRows in-window replacement scoped correctly across runs.
+var CHANGE_EVENT_KEY_COLS = ['account_id', 'change_event_resource_name', 'date'];
 
 function getSheetUrl() {
   if (SHEET_URL.indexOf('REPLACE_ME') !== -1) {
@@ -63,6 +86,7 @@ function runReports(ss) {
 
   writeCampaigns(ss, ctx);
   writeSearchTerms(ss, ctx);
+  writeChangeEvents(ss, ctx);
 
   Logger.log('runReports → done');
 }
@@ -254,12 +278,80 @@ function writeSearchTerms(ss, ctx) {
   upsertRows(sheet, SEARCH_TERM_HEADERS, SEARCH_TERM_KEY_COLS, rows, ctx.accountId, ctx.dateRange);
 }
 
+function writeChangeEvents(ss, ctx) {
+  var sheet = ss.getSheetByName(CHANGE_EVENTS_TAB) || ss.insertSheet(CHANGE_EVENTS_TAB);
+  ensureHeaders(sheet, CHANGE_EVENT_HEADERS);
+
+  // change_event is datetime-segmented, not date-segmented like the metrics
+  // resources. Use the same rolling window in account timezone; LIMIT +
+  // ORDER BY are both mandated by Google's change_event API.
+  var query =
+    'SELECT ' +
+      'change_event.resource_name, ' +
+      'change_event.change_date_time, ' +
+      'change_event.change_resource_type, ' +
+      'change_event.change_resource_name, ' +
+      'change_event.resource_change_operation, ' +
+      'change_event.changed_fields, ' +
+      'change_event.client_type, ' +
+      'change_event.user_email, ' +
+      'change_event.old_resource, ' +
+      'change_event.new_resource, ' +
+      'change_event.campaign, ' +
+      'change_event.ad_group, ' +
+      'change_event.feed, ' +
+      'campaign.id, ' +
+      'campaign.name ' +
+    'FROM change_event ' +
+    "WHERE change_event.change_date_time BETWEEN '" + ctx.dateRange.start + " 00:00:00' AND '" + ctx.dateRange.end + " 23:59:59' " +
+    'ORDER BY change_event.change_date_time DESC ' +
+    'LIMIT ' + CHANGE_EVENT_LIMIT;
+
+  var iter = AdsApp.search(query);
+  var rows = [];
+  while (iter.hasNext()) {
+    var r = iter.next();
+    var ce = r.changeEvent || {};
+    var dt = ce.changeDateTime || '';
+    var date = dt.length >= 10 ? dt.substring(0, 10) : '';
+
+    rows.push([
+      date,
+      dt,
+      ctx.accountName,
+      ctx.accountId,
+      ce.resourceName || '',
+      ce.changeResourceType || '',
+      ce.resourceChangeOperation || '',
+      ce.changeResourceName || '',
+      ce.campaign || '',
+      ce.adGroup || '',
+      ce.feed || '',
+      (r.campaign && r.campaign.id) ? String(r.campaign.id) : '',
+      (r.campaign && r.campaign.name) ? r.campaign.name : '',
+      ce.userEmail || '',
+      ce.clientType || '',
+      JSON.stringify(ce.changedFields || {}),
+      JSON.stringify(ce.oldResource || {}),
+      JSON.stringify(ce.newResource || {}),
+      ctx.runTimestamp
+    ]);
+  }
+
+  Logger.log('Change-event rows collected: ' + rows.length);
+  if (rows.length >= CHANGE_EVENT_LIMIT) {
+    Logger.log('change_event LIMIT ' + CHANGE_EVENT_LIMIT + ' reached — possible truncation');
+  }
+  upsertRows(sheet, CHANGE_EVENT_HEADERS, CHANGE_EVENT_KEY_COLS, rows, ctx.accountId, ctx.dateRange);
+}
+
 // Columns whose values are text but happen to look like something Sheets'
 // "Automatic" format would auto-coerce — `date` → Date object, `last_updated`
 // → Date object (ISO8601 with `T`/`Z` is close enough that some locales parse
 // it). Coercion breaks the downstream gviz CSV contract: the Laravel sync
 // expects the raw string we wrote, not a locale-formatted Date readback.
-var TEXT_FORMATTED_COLUMNS = ['date', 'last_updated'];
+// `change_date_time` carries Google's `YYYY-MM-DD HH:MM:SS` form — same risk.
+var TEXT_FORMATTED_COLUMNS = ['date', 'last_updated', 'change_date_time'];
 
 function ensureHeaders(sheet, headers) {
   if (sheet.getLastRow() === 0) {
