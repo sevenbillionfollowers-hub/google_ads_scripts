@@ -39,7 +39,7 @@ var CHANGE_EVENT_HEADERS = [
   'change_event_resource_name',
   'change_resource_type', 'resource_change_operation',
   'changed_resource_name',
-  'campaign_resource_name', 'ad_group_resource_name', 'feed_resource_name',
+  'campaign_resource_name', 'ad_group_resource_name',
   'campaign_id', 'campaign_name',
   'user_email', 'client_type',
   'changed_fields_json', 'old_resource_json', 'new_resource_json',
@@ -299,7 +299,6 @@ function writeChangeEvents(ss, ctx) {
       'change_event.new_resource, ' +
       'change_event.campaign, ' +
       'change_event.ad_group, ' +
-      'change_event.feed, ' +
       'campaign.id, ' +
       'campaign.name ' +
     'FROM change_event ' +
@@ -326,7 +325,6 @@ function writeChangeEvents(ss, ctx) {
       ce.changeResourceName || '',
       ce.campaign || '',
       ce.adGroup || '',
-      ce.feed || '',
       (r.campaign && r.campaign.id) ? String(r.campaign.id) : '',
       (r.campaign && r.campaign.name) ? r.campaign.name : '',
       ce.userEmail || '',
