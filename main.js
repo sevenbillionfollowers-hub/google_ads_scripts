@@ -18,7 +18,8 @@ var CAMPAIGN_HEADERS = [
   'primary_status', 'primary_status_reasons',
   'last_updated',
   'daily_budget', 'target_cpa', 'bidding_strategy_type',
-  'account_timezone'
+  'account_timezone',
+  'campaign_geo'
 ];
 
 var CAMPAIGN_KEY_COLS = ['account_id', 'campaign_id', 'date'];
@@ -74,6 +75,7 @@ function runReports(ss) {
     timezone:     account.getTimeZone(),
     dateRange:    computeDateRange(DATE_WINDOW_DAYS, account.getTimeZone()),
     campaignUrls: fetchCampaignFinalUrls(),
+    campaignGeo:  fetchCampaignGeoTargets(),
     runTimestamp: new Date().toISOString()
   };
 
@@ -135,6 +137,114 @@ function collectFinalUrls(whereClause) {
     }
   }
   return urls;
+}
+
+// Resolve each campaign's location TARGETING to a country code → { campaignId:
+// 'AU' | 'US' | … | 'MULTI' }. This is the campaign's geo targeting (what
+// Google Ads serves to), NOT the account timezone — the Campaigns dashboard
+// warns when it diverges from the landing's intended geo.
+//
+// Two-step: (1) collect each campaign's positive (non-negative) LOCATION
+// criteria as geo_target_constant resource names, (2) resolve those constants
+// to ISO country codes. Sub-country targets (region/city) still carry the
+// country_code of the country they belong to, so the reduction works for
+// country-, region-, and city-level targeting alike. A campaign with no
+// location criteria (targets everywhere) is simply absent → '' downstream.
+//
+// Wrapped whole: any GAQL/permission error must degrade to an empty map and
+// leave the column blank rather than abort writeCampaigns and the whole run.
+function fetchCampaignGeoTargets() {
+  try {
+    var gtcByCampaign = {};   // campaignId → { geoTargetConstantResourceName: true }
+    var allGtc = {};          // geoTargetConstantResourceName → true
+    var critQuery =
+      'SELECT ' +
+        'campaign.id, ' +
+        'campaign_criterion.location.geo_target_constant, ' +
+        'campaign_criterion.negative ' +
+      'FROM campaign_criterion ' +
+      "WHERE campaign_criterion.type = 'LOCATION' " +
+        "AND campaign.status != 'REMOVED'";
+
+    var it = AdsApp.search(critQuery);
+    while (it.hasNext()) {
+      var r = it.next();
+      var crit = r.campaignCriterion || {};
+      // Negative (excluded) locations don't define where the campaign serves.
+      if (crit.negative === true) continue;
+      var gtc = crit.location && crit.location.geoTargetConstant;
+      if (!gtc) continue;
+      var cid = String(r.campaign.id);
+      if (!gtcByCampaign[cid]) gtcByCampaign[cid] = {};
+      gtcByCampaign[cid][gtc] = true;
+      allGtc[gtc] = true;
+    }
+
+    var countryByGtc = resolveGeoTargetCountryCodes(Object.keys(allGtc));
+
+    var geoByCampaign = {};
+    for (var c in gtcByCampaign) {
+      if (!gtcByCampaign.hasOwnProperty(c)) continue;
+      var countries = {};
+      for (var g in gtcByCampaign[c]) {
+        if (!gtcByCampaign[c].hasOwnProperty(g)) continue;
+        var cc = countryByGtc[g];
+        if (cc) countries[cc] = true;
+      }
+      var list = [];
+      for (var k in countries) if (countries.hasOwnProperty(k)) list.push(k);
+      geoByCampaign[c] = list.length === 1 ? list[0] : (list.length > 1 ? 'MULTI' : '');
+    }
+    Logger.log('Campaign geo targets resolved: ' + Object.keys(geoByCampaign).length + ' campaigns');
+    return geoByCampaign;
+  } catch (e) {
+    Logger.log('fetchCampaignGeoTargets failed (leaving campaign_geo blank): ' + e);
+    return {};
+  }
+}
+
+// Map geo_target_constant resource names → ISO-3166 alpha-2 country code.
+// geo_target_constant.country_code is the country a target belongs to for
+// every target_type (Country/Region/City/…), so one lookup covers them all.
+// Filter by the numeric id (parsed from the "geoTargetConstants/{id}" resource
+// name) — the canonical, broadly-supported GAQL form — then key results back to
+// the original resource name. Chunked IN-clauses keep each query within limits.
+function resolveGeoTargetCountryCodes(resourceNames) {
+  var out = {};
+  if (!resourceNames || !resourceNames.length) return out;
+
+  var ids = [];
+  var resourceById = {};
+  for (var i = 0; i < resourceNames.length; i++) {
+    var rn = String(resourceNames[i]);
+    var parts = rn.split('/');
+    var id = parts[parts.length - 1];
+    if (id) {
+      ids.push(id);
+      resourceById[id] = rn;
+    }
+  }
+
+  var CHUNK = 500;
+  for (var k = 0; k < ids.length; k += CHUNK) {
+    var chunk = ids.slice(k, k + CHUNK);
+    var q =
+      'SELECT ' +
+        'geo_target_constant.id, ' +
+        'geo_target_constant.country_code ' +
+      'FROM geo_target_constant ' +
+      'WHERE geo_target_constant.id IN (' + chunk.join(', ') + ')';
+    var it = AdsApp.search(q);
+    while (it.hasNext()) {
+      var r = it.next();
+      var gtc = r.geoTargetConstant || {};
+      var gid = (gtc.id !== null && gtc.id !== undefined) ? String(gtc.id) : null;
+      if (gid && gtc.countryCode && resourceById[gid]) {
+        out[resourceById[gid]] = String(gtc.countryCode).toUpperCase();
+      }
+    }
+  }
+  return out;
 }
 
 function writeCampaigns(ss, ctx) {
@@ -212,7 +322,8 @@ function writeCampaigns(ss, ctx) {
       budget,
       tcpa,
       biddingType,
-      ctx.timezone
+      ctx.timezone,
+      ctx.campaignGeo[r.campaign.id] || ''
     ]);
   }
 
