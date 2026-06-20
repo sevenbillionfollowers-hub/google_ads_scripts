@@ -2,6 +2,7 @@ var SHEET_URL         = 'https://docs.google.com/spreadsheets/d/108CnrRFLlMxmrS-
 var DATE_WINDOW_DAYS  = 3;
 var CAMPAIGNS_TAB     = 'Campaigns';
 var SEARCH_TERMS_TAB  = 'SearchTerms';
+var KEYWORDS_TAB      = 'Keywords';
 var CHANGE_EVENTS_TAB = 'ChangeEvents';
 
 // change_event.change_date_time → `date` is the YYYY-MM-DD slice so upsertRows'
@@ -19,7 +20,12 @@ var CAMPAIGN_HEADERS = [
   'last_updated',
   'daily_budget', 'target_cpa', 'bidding_strategy_type',
   'account_timezone',
-  'campaign_geo'
+  'campaign_geo',
+  // Trailing additions (ensureHeaders auto-appends these to existing sheets):
+  // advertising_channel_sub_type + the campaign's conversion goals (JSON of
+  // {category, origin, biddable} from the campaign_conversion_goal resource).
+  // The derived "marketing objective" label is computed downstream in Laravel.
+  'channel_sub_type', 'conversion_goals'
 ];
 
 var CAMPAIGN_KEY_COLS = ['account_id', 'campaign_id', 'date'];
@@ -34,6 +40,22 @@ var SEARCH_TERM_HEADERS = [
 ];
 
 var SEARCH_TERM_KEY_COLS = ['account_id', 'campaign_id', 'ad_group_name', 'keyword', 'search_term', 'date'];
+
+var KEYWORD_HEADERS = [
+  'date', 'account_name', 'account_id', 'campaign_id', 'campaign_name',
+  'ad_group_id', 'ad_group_name', 'criterion_id', 'keyword', 'match_type',
+  // Keyword quality metrics (date-segmented via metrics.historical_*):
+  'quality_score', 'ad_relevance', 'landing_page_experience', 'expected_ctr',
+  'impressions', 'clicks', 'cost', 'ctr', 'avg_cpc',
+  'conversions', 'conversion_value',
+  'currency_code',
+  'last_updated'
+];
+
+// criterion_id is unique per keyword within an ad group; combined with
+// account/campaign/ad_group it's globally unique. Including `date` keeps the
+// in-window replacement scoped correctly across runs (same as the other tabs).
+var KEYWORD_KEY_COLS = ['account_id', 'campaign_id', 'ad_group_id', 'criterion_id', 'date'];
 
 var CHANGE_EVENT_HEADERS = [
   'date', 'change_date_time', 'account_name', 'account_id',
@@ -76,6 +98,7 @@ function runReports(ss) {
     dateRange:    computeDateRange(DATE_WINDOW_DAYS, account.getTimeZone()),
     campaignUrls: fetchCampaignFinalUrls(),
     campaignGeo:  fetchCampaignGeoTargets(),
+    conversionGoals: fetchCampaignConversionGoals(),
     runTimestamp: new Date().toISOString()
   };
 
@@ -88,6 +111,7 @@ function runReports(ss) {
 
   writeCampaigns(ss, ctx);
   writeSearchTerms(ss, ctx);
+  writeKeywords(ss, ctx);
   writeChangeEvents(ss, ctx);
 
   Logger.log('runReports → done');
@@ -247,6 +271,69 @@ function resolveGeoTargetCountryCodes(resourceNames) {
   return out;
 }
 
+// Resolve each campaign's conversion goals → { campaignId: [{category, origin,
+// biddable}, …] }. `campaign_conversion_goal` is an attributes-only resource
+// (no metrics, no date segmentation) — it lists which conversion-goal
+// categories a campaign counts/optimizes for. The biddable categories are the
+// signal Laravel uses to derive a "marketing objective" label downstream.
+//
+// The `.campaign` field is a resource name (customers/{cid}/campaigns/{id});
+// we parse the trailing id rather than join campaign.id, so a join quirk can't
+// abort the whole run. Wrapped whole: any GAQL/permission error degrades to an
+// empty map and leaves the column blank — mirrors fetchCampaignGeoTargets().
+function fetchCampaignConversionGoals() {
+  try {
+    var query =
+      'SELECT ' +
+        'campaign_conversion_goal.campaign, ' +
+        'campaign_conversion_goal.category, ' +
+        'campaign_conversion_goal.origin, ' +
+        'campaign_conversion_goal.biddable ' +
+      'FROM campaign_conversion_goal';
+
+    var goalsByCampaign = {};
+    var it = AdsApp.search(query);
+    while (it.hasNext()) {
+      var r = it.next();
+      var g = r.campaignConversionGoal || {};
+      var resName = String(g.campaign || '');
+      var parts = resName.split('/');
+      var cid = parts[parts.length - 1];
+      if (!cid) continue;
+
+      var cat = normEnumToken(g.category);
+      var origin = normEnumToken(g.origin);
+      if (!goalsByCampaign[cid]) goalsByCampaign[cid] = [];
+      goalsByCampaign[cid].push({
+        category: cat,
+        origin: origin,
+        biddable: g.biddable === true
+      });
+    }
+    Logger.log('Campaign conversion goals resolved: ' + Object.keys(goalsByCampaign).length + ' campaigns');
+    return goalsByCampaign;
+  } catch (e) {
+    Logger.log('fetchCampaignConversionGoals failed (leaving conversion_goals blank): ' + e);
+    return {};
+  }
+}
+
+// Normalize a Google enum token: UNSPECIFIED/UNKNOWN/blank → '' (so Laravel
+// stores it as "absent" rather than noise). Otherwise pass the uppercase token.
+function normEnumToken(v) {
+  var s = String(v || '').toUpperCase();
+  if (s === '' || s === 'UNSPECIFIED' || s === 'UNKNOWN') return '';
+  return s;
+}
+
+// QualityScoreBucket enum (historical_*_quality_score) → keep only the three
+// meaningful buckets; everything else (UNKNOWN/UNSPECIFIED/blank) → ''.
+function normQualityBucket(v) {
+  var s = String(v || '').toUpperCase();
+  if (s === 'BELOW_AVERAGE' || s === 'AVERAGE' || s === 'ABOVE_AVERAGE') return s;
+  return '';
+}
+
 function writeCampaigns(ss, ctx) {
   var sheet = ss.getSheetByName(CAMPAIGNS_TAB) || ss.insertSheet(CAMPAIGNS_TAB);
   ensureHeaders(sheet, CAMPAIGN_HEADERS);
@@ -260,6 +347,7 @@ function writeCampaigns(ss, ctx) {
       'campaign.primary_status, ' +
       'campaign.primary_status_reasons, ' +
       'campaign.advertising_channel_type, ' +
+      'campaign.advertising_channel_sub_type, ' +
       'campaign.bidding_strategy_type, ' +
       'campaign.target_cpa.target_cpa_micros, ' +
       'campaign.maximize_conversions.target_cpa_micros, ' +
@@ -323,7 +411,9 @@ function writeCampaigns(ss, ctx) {
       tcpa,
       biddingType,
       ctx.timezone,
-      ctx.campaignGeo[r.campaign.id] || ''
+      ctx.campaignGeo[r.campaign.id] || '',
+      normEnumToken(r.campaign.advertisingChannelSubType),
+      JSON.stringify(ctx.conversionGoals[r.campaign.id] || [])
     ]);
   }
 
@@ -387,6 +477,83 @@ function writeSearchTerms(ss, ctx) {
 
   Logger.log('Search-term rows collected: ' + rows.length);
   upsertRows(sheet, SEARCH_TERM_HEADERS, SEARCH_TERM_KEY_COLS, rows, ctx.accountId, ctx.dateRange);
+}
+
+function writeKeywords(ss, ctx) {
+  var sheet = ss.getSheetByName(KEYWORDS_TAB) || ss.insertSheet(KEYWORDS_TAB);
+  ensureHeaders(sheet, KEYWORD_HEADERS);
+
+  // keyword_view is the keyword (ad_group_criterion) level — quality metrics
+  // live here, NOT on search_term_view. The historical_* metrics are
+  // date-segmentable (the plain ad_group_criterion.quality_info.* snapshot is
+  // not, and would repeat today's value across every date row).
+  var query =
+    'SELECT ' +
+      'segments.date, ' +
+      'campaign.id, ' +
+      'campaign.name, ' +
+      'ad_group.id, ' +
+      'ad_group.name, ' +
+      'ad_group_criterion.criterion_id, ' +
+      'ad_group_criterion.keyword.text, ' +
+      'ad_group_criterion.keyword.match_type, ' +
+      'metrics.historical_quality_score, ' +
+      'metrics.historical_creative_quality_score, ' +
+      'metrics.historical_landing_page_quality_score, ' +
+      'metrics.historical_search_predicted_ctr, ' +
+      'metrics.impressions, ' +
+      'metrics.clicks, ' +
+      'metrics.cost_micros, ' +
+      'metrics.ctr, ' +
+      'metrics.average_cpc, ' +
+      'metrics.conversions, ' +
+      'metrics.conversions_value ' +
+    'FROM keyword_view ' +
+    "WHERE segments.date BETWEEN '" + ctx.dateRange.start + "' AND '" + ctx.dateRange.end + "' " +
+      "AND ad_group_criterion.type = 'KEYWORD'";
+
+  var iter = AdsApp.search(query);
+  var rows = [];
+  while (iter.hasNext()) {
+    var r = iter.next();
+    var crit = r.adGroupCriterion || {};
+    var kw = crit.keyword || {};
+    var cost   = Number(r.metrics.costMicros || 0) / 1e6;
+    var avgCpc = Number(r.metrics.averageCpc || 0) / 1e6;
+
+    // historical_quality_score is int64 1–10; 0/absent means Google has no QS
+    // for this keyword/date — emit '' so Laravel stores NULL, not 0.
+    var qs = Number(r.metrics.historicalQualityScore || 0);
+
+    rows.push([
+      r.segments.date,
+      ctx.accountName,
+      ctx.accountId,
+      r.campaign.id,
+      r.campaign.name,
+      r.adGroup.id,
+      r.adGroup.name,
+      crit.criterionId,
+      kw.text || '',
+      normEnumToken(kw.matchType),
+      qs >= 1 ? qs : '',
+      normQualityBucket(r.metrics.historicalCreativeQualityScore),
+      normQualityBucket(r.metrics.historicalLandingPageQualityScore),
+      normQualityBucket(r.metrics.historicalSearchPredictedCtr),
+      Number(r.metrics.impressions || 0),
+      Number(r.metrics.clicks || 0),
+      cost,
+      Number(r.metrics.ctr || 0),
+      avgCpc,
+      Number(r.metrics.conversions || 0),
+      Number(r.metrics.conversionsValue || 0),
+      ctx.currencyCode,
+      ctx.runTimestamp
+    ]);
+  }
+
+  Logger.log('Keyword rows collected: ' + rows.length);
+  upsertRows(sheet, KEYWORD_HEADERS, KEYWORD_KEY_COLS, rows, ctx.accountId, ctx.dateRange);
 }
 
 function writeChangeEvents(ss, ctx) {
