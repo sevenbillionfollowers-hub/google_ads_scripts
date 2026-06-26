@@ -1,5 +1,5 @@
 var SHEET_URL         = 'https://docs.google.com/spreadsheets/d/108CnrRFLlMxmrS-9PQwUN1-JypODUkin3c_0UXlTV2o/edit';
-var DATE_WINDOW_DAYS  = 3;
+var DATE_WINDOW_DAYS  = 7;
 var CAMPAIGNS_TAB     = 'Campaigns';
 var SEARCH_TERMS_TAB  = 'SearchTerms';
 var KEYWORDS_TAB      = 'Keywords';
