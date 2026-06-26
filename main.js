@@ -25,7 +25,10 @@ var CAMPAIGN_HEADERS = [
   // advertising_channel_sub_type + the campaign's conversion goals (JSON of
   // {category, origin, biddable} from the campaign_conversion_goal resource).
   // The derived "marketing objective" label is computed downstream in Laravel.
-  'channel_sub_type', 'conversion_goals'
+  'channel_sub_type', 'conversion_goals',
+  // metrics.invalid_clicks (count Google filtered as invalid — not billed) +
+  // the paired metrics.invalid_click_rate (invalid ÷ (invalid + valid) clicks).
+  'invalid_clicks', 'invalid_click_rate'
 ];
 
 var CAMPAIGN_KEY_COLS = ['account_id', 'campaign_id', 'date'];
@@ -358,7 +361,9 @@ function writeCampaigns(ss, ctx) {
       'metrics.ctr, ' +
       'metrics.average_cpc, ' +
       'metrics.conversions, ' +
-      'metrics.conversions_value ' +
+      'metrics.conversions_value, ' +
+      'metrics.invalid_clicks, ' +
+      'metrics.invalid_click_rate ' +
     'FROM campaign ' +
     "WHERE segments.date BETWEEN '" + ctx.dateRange.start + "' AND '" + ctx.dateRange.end + "'";
 
@@ -413,7 +418,9 @@ function writeCampaigns(ss, ctx) {
       ctx.timezone,
       ctx.campaignGeo[r.campaign.id] || '',
       normEnumToken(r.campaign.advertisingChannelSubType),
-      JSON.stringify(ctx.conversionGoals[r.campaign.id] || [])
+      JSON.stringify(ctx.conversionGoals[r.campaign.id] || []),
+      Number(r.metrics.invalidClicks || 0),
+      Number(r.metrics.invalidClickRate || 0)
     ]);
   }
 
