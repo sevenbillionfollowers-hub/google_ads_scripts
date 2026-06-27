@@ -28,7 +28,12 @@ var CAMPAIGN_HEADERS = [
   'channel_sub_type', 'conversion_goals',
   // metrics.invalid_clicks (count Google filtered as invalid — not billed) +
   // the paired metrics.invalid_click_rate (invalid ÷ (invalid + valid) clicks).
-  'invalid_clicks', 'invalid_click_rate'
+  'invalid_clicks', 'invalid_click_rate',
+  // metrics.average_target_cpa_micros — the traffic-weighted target CPA the bid
+  // strategy actually optimized toward over the write window (NOT the static
+  // `target_cpa` setting). Resolved by fetchCampaignAvgTargetCpa() as one
+  // window-aggregated value per campaign.
+  'avg_target_cpa'
 ];
 
 var CAMPAIGN_KEY_COLS = ['account_id', 'campaign_id', 'date'];
@@ -93,15 +98,19 @@ function runReports(ss) {
   // gets the same `last_updated` value, so Laravel can trust the column to
   // reflect "when did the Ads Script actually run", not "when did the Sheet
   // row last get upserted" (the Laravel command stamps its own column too).
+  // dateRange is needed both as ctx.dateRange and as the window for the avg
+  // target CPA metric query, so resolve it into a local first.
+  var dateRange = computeDateRange(DATE_WINDOW_DAYS, account.getTimeZone());
   var ctx = {
     accountId:    account.getCustomerId(),
     accountName:  account.getName(),
     currencyCode: account.getCurrencyCode(),
     timezone:     account.getTimeZone(),
-    dateRange:    computeDateRange(DATE_WINDOW_DAYS, account.getTimeZone()),
+    dateRange:    dateRange,
     campaignUrls: fetchCampaignFinalUrls(),
     campaignGeo:  fetchCampaignGeoTargets(),
     conversionGoals: fetchCampaignConversionGoals(),
+    avgTargetCpa: fetchCampaignAvgTargetCpa(dateRange),
     runTimestamp: new Date().toISOString()
   };
 
@@ -337,6 +346,50 @@ function normQualityBucket(v) {
   return '';
 }
 
+// Resolve each campaign's AVERAGE target CPA over the write window →
+// { campaignId: number (account currency) }. Unlike campaign.target_cpa (the
+// current *setting*, already captured per-row from
+// campaign.target_cpa.target_cpa_micros), metrics.average_target_cpa_micros is
+// the traffic-weighted target the bid strategy actually optimized toward across
+// the period — folding in device bid adjustments, ad-group target overrides,
+// and any mid-window changes to the target. This is the value Google surfaces
+// as the "Avg. target CPA" column/header.
+//
+// We deliberately keep segments.date in the WHERE filter ONLY (not in SELECT),
+// so Google returns one window-aggregated row per campaign — matching the
+// header figure for the date range, and side-stepping any segments.date
+// selectability constraint on the metric.
+//
+// Wrapped whole: any GAQL/permission/compat error degrades to an empty map and
+// leaves the column blank rather than abort writeCampaigns and the whole run —
+// mirrors fetchCampaignGeoTargets()/fetchCampaignConversionGoals().
+function fetchCampaignAvgTargetCpa(dateRange) {
+  try {
+    var query =
+      'SELECT ' +
+        'campaign.id, ' +
+        'metrics.average_target_cpa_micros ' +
+      'FROM campaign ' +
+      "WHERE segments.date BETWEEN '" + dateRange.start + "' AND '" + dateRange.end + "'";
+
+    var out = {};
+    var it = AdsApp.search(query);
+    while (it.hasNext()) {
+      var r = it.next();
+      var micros = (r.metrics && r.metrics.averageTargetCpaMicros) || 0;
+      var v = Number(micros) > 0 ? Number(micros) / 1e6 : 0;
+      // Only campaigns running a tCPA-style strategy report a value; the rest
+      // come back 0/absent → leave them out so the column stores NULL, not 0.
+      if (v > 0) out[String(r.campaign.id)] = v;
+    }
+    Logger.log('Campaign avg target CPA resolved: ' + Object.keys(out).length + ' campaigns');
+    return out;
+  } catch (e) {
+    Logger.log('fetchCampaignAvgTargetCpa failed (leaving avg_target_cpa blank): ' + e);
+    return {};
+  }
+}
+
 function writeCampaigns(ss, ctx) {
   var sheet = ss.getSheetByName(CAMPAIGNS_TAB) || ss.insertSheet(CAMPAIGNS_TAB);
   ensureHeaders(sheet, CAMPAIGN_HEADERS);
@@ -420,7 +473,10 @@ function writeCampaigns(ss, ctx) {
       normEnumToken(r.campaign.advertisingChannelSubType),
       JSON.stringify(ctx.conversionGoals[r.campaign.id] || []),
       Number(r.metrics.invalidClicks || 0),
-      Number(r.metrics.invalidClickRate || 0)
+      Number(r.metrics.invalidClickRate || 0),
+      // Window-aggregated avg target CPA (same value on every day-row for a
+      // campaign; the Laravel sync collapses to one parent row per campaign).
+      ctx.avgTargetCpa[r.campaign.id] || ''
     ]);
   }
 
