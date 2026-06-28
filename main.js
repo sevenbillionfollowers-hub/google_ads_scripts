@@ -121,10 +121,24 @@ function runReports(ss) {
     'window=' + ctx.dateRange.start + '..' + ctx.dateRange.end
   );
 
-  writeCampaigns(ss, ctx);
-  writeSearchTerms(ss, ctx);
-  writeKeywords(ss, ctx);
-  writeChangeEvents(ss, ctx);
+  // All N accounts write to ONE shared spreadsheet on independent hourly
+  // schedules, and upsertRows is an unlocked whole-tab read→clearContent→setValues.
+  // Concurrent runs used to interleave and splice one account's columns onto
+  // another account's row (proven by an account_id/account_timezone mismatch on a
+  // single physical row — both come from the same account object in one run, so
+  // they can only disagree if two runs co-wrote the row). Serialize the entire
+  // write phase behind a sheet-anchored mutex. A per-script LockService cannot
+  // help: every account runs main.js as its OWN Apps Script project, so the lock
+  // must live in the one resource they all share — the spreadsheet itself.
+  var lockToken = acquireSheetLock(ss);
+  try {
+    writeCampaigns(ss, ctx);
+    writeSearchTerms(ss, ctx);
+    writeKeywords(ss, ctx);
+    writeChangeEvents(ss, ctx);
+  } finally {
+    releaseSheetLock(ss, lockToken);
+  }
 
   Logger.log('runReports → done');
 }
@@ -481,7 +495,7 @@ function writeCampaigns(ss, ctx) {
   }
 
   Logger.log('Campaigns rows collected: ' + rows.length);
-  upsertRows(sheet, CAMPAIGN_HEADERS, CAMPAIGN_KEY_COLS, rows, ctx.accountId, ctx.dateRange);
+  upsertRows(sheet, CAMPAIGN_HEADERS, CAMPAIGN_KEY_COLS, rows, ctx.accountId, ctx.dateRange, ctx.timezone);
 }
 
 function writeSearchTerms(ss, ctx) {
@@ -741,11 +755,68 @@ function applyTextFormats(sheet, headers, skipBefore) {
   }
 }
 
-function upsertRows(sheet, headers, keyCols, newRows, accountId, dateRange) {
+// Sheet-anchored cross-account mutex. Apps Script LockService is scoped per
+// project, and every Google Ads account runs main.js as its OWN project, so a
+// ScriptLock/DocumentLock does NOT serialize the N accounts that share this one
+// Sheet. The only thing they all share is the spreadsheet — so the lock lives in
+// it: compare-and-set a token into `_lock!A1`, flush, then re-read after a short
+// jittered settle; if our token survived, we own the lock. A held lock older than
+// STALE_LOCK_MS is treated as abandoned (a prior run that crashed/timed out) and
+// reclaimed, so a dead run can never wedge the whole fleet.
+var LOCK_SHEET = '_lock';
+var STALE_LOCK_MS = 180000;       // 3 min — comfortably longer than one run's sheet work
+var LOCK_MAX_ATTEMPTS = 40;
+
+function acquireSheetLock(ss) {
+  var meta = ss.getSheetByName(LOCK_SHEET) || ss.insertSheet(LOCK_SHEET);
+  var cell = meta.getRange('A1');
+  var token = Utilities.getUuid() + '@' + (new Date().getTime());
+  for (var attempt = 0; attempt < LOCK_MAX_ATTEMPTS; attempt++) {
+    var cur = String(cell.getValue() || '');
+    var heldTs = cur ? Number(cur.split('@')[1] || 0) : 0;
+    if (cur === '' || (new Date().getTime() - heldTs) > STALE_LOCK_MS) {
+      cell.setValue(token);
+      SpreadsheetApp.flush();
+      Utilities.sleep(250 + Math.floor(Math.random() * 500)); // let a racing CAS settle
+      if (String(cell.getValue()) === token) {
+        return token;                                          // we won the compare-and-set
+      }
+    }
+    Utilities.sleep(1000 + Math.floor(Math.random() * 2000));  // contended — back off + retry
+  }
+  throw new Error('acquireSheetLock: timed out after ' + LOCK_MAX_ATTEMPTS + ' attempts');
+}
+
+function releaseSheetLock(ss, token) {
+  if (!token) return;
+  var meta = ss.getSheetByName(LOCK_SHEET);
+  if (!meta) return;
+  var cell = meta.getRange('A1');
+  if (String(cell.getValue()) === token) {
+    cell.clearContent();
+    SpreadsheetApp.flush();
+  }
+}
+
+function upsertRows(sheet, headers, keyCols, newRows, accountId, dateRange, expectAccountTimezone) {
   var dateCol = headers.indexOf('date');
   var acctCol = headers.indexOf('account_id');
   if (dateCol < 0 || acctCol < 0) {
     throw new Error('upsertRows: headers must include date + account_id');
+  }
+
+  // FAIL CLOSED on header-width skew. If the live Sheet is WIDER than the columns
+  // this (possibly CDN-stale) main.js knows about, a clear/write bounded by
+  // headers.length rewrites only the LEADING columns and strands the trailing
+  // ones from whatever campaign physically preceded this row — the exact cross-
+  // campaign column smear being fixed here. Refuse to write rather than corrupt;
+  // the account self-heals on its next run once it fetches the current main.js.
+  var sheetCols = sheet.getLastColumn();
+  if (sheetCols > headers.length) {
+    throw new Error('upsertRows: tab "' + sheet.getName() + '" has ' + sheetCols +
+      ' columns but this main.js knows ' + headers.length +
+      ' — refusing to write a short row into a wide sheet (CDN-stale code). ' +
+      'Re-run after the new main.js propagates.');
   }
 
   var keyIdx = [];
@@ -796,6 +867,31 @@ function upsertRows(sheet, headers, keyCols, newRows, accountId, dateRange) {
   }
   if (finalRows.length > 0) {
     sheet.getRange(2, 1, finalRows.length, headers.length).setValues(finalRows);
+  }
+
+  // Post-write self-check — cheap insurance against a mutex failure or a still-
+  // unpatched account writing without the lock (e.g. mid-rollout of this fix).
+  // Re-read only the rows we just appended (the tail after keepRows) and assert
+  // they carry THIS account's id, and — for the Campaigns tab — this account's
+  // timezone. A mismatch means another account's write landed on our rows; throw
+  // loudly so the run fails visibly instead of shipping a contaminated row.
+  if (newRows.length > 0) {
+    var tzCol = headers.indexOf('account_timezone');
+    var firstNewRow = 2 + keepRows.length;
+    var written = sheet.getRange(firstNewRow, 1, newRows.length, headers.length).getValues();
+    for (var w = 0; w < written.length; w++) {
+      if (String(written[w][acctCol]) !== String(accountId)) {
+        throw new Error('upsertRows self-check FAILED on "' + sheet.getName() +
+          '" row ' + (firstNewRow + w) + ': account_id="' + written[w][acctCol] +
+          '" expected "' + accountId + '" — concurrent-write contamination.');
+      }
+      if (expectAccountTimezone && tzCol >= 0 &&
+          String(written[w][tzCol]) !== String(expectAccountTimezone)) {
+        throw new Error('upsertRows self-check FAILED on "' + sheet.getName() +
+          '" row ' + (firstNewRow + w) + ': account_timezone="' + written[w][tzCol] +
+          '" expected "' + expectAccountTimezone + '".');
+      }
+    }
   }
 }
 
