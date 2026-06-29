@@ -130,14 +130,23 @@ function runReports(ss) {
   // write phase behind a sheet-anchored mutex. A per-script LockService cannot
   // help: every account runs main.js as its OWN Apps Script project, so the lock
   // must live in the one resource they all share — the spreadsheet itself.
-  var lockToken = acquireSheetLock(ss);
+  var lockUuid = acquireSheetLock(ss);
   try {
+    // Heartbeat the lock between phases so STALE_LOCK_MS measures "time since
+    // the holder last made progress", not "time since acquisition". Without this
+    // a long but healthy write phase would look abandoned and a patient waiter
+    // would reclaim a live lock — re-introducing the cross-account column smear
+    // the mutex exists to prevent. refreshSheetLock() also throws if we've lost
+    // ownership, stopping us from co-writing over a reclaimer.
     writeCampaigns(ss, ctx);
+    refreshSheetLock(ss, lockUuid);
     writeSearchTerms(ss, ctx);
+    refreshSheetLock(ss, lockUuid);
     writeKeywords(ss, ctx);
+    refreshSheetLock(ss, lockUuid);
     writeChangeEvents(ss, ctx);
   } finally {
-    releaseSheetLock(ss, lockToken);
+    releaseSheetLock(ss, lockUuid);
   }
 
   Logger.log('runReports → done');
@@ -759,40 +768,79 @@ function applyTextFormats(sheet, headers, skipBefore) {
 // project, and every Google Ads account runs main.js as its OWN project, so a
 // ScriptLock/DocumentLock does NOT serialize the N accounts that share this one
 // Sheet. The only thing they all share is the spreadsheet — so the lock lives in
-// it: compare-and-set a token into `_lock!A1`, flush, then re-read after a short
-// jittered settle; if our token survived, we own the lock. A held lock older than
-// STALE_LOCK_MS is treated as abandoned (a prior run that crashed/timed out) and
-// reclaimed, so a dead run can never wedge the whole fleet.
+// it: `_lock!A1` holds `{uuid}@{ts}`. The uuid is the lock's identity (stable for
+// the whole hold); the ts is a heartbeat the holder bumps between write phases.
+// To take the lock: compare-and-set our uuid, flush, re-read after a short
+// jittered settle; if our uuid survived, we own it. A lock whose heartbeat is
+// older than STALE_LOCK_MS is treated as abandoned (a run that crashed/timed out)
+// and reclaimed, so a dead run can never wedge the whole fleet.
+//
+// INVARIANT: LOCK_ACQUIRE_TIMEOUT_MS MUST exceed STALE_LOCK_MS. The original code
+// gave up after a fixed 40 back-offs (~40-120s) — SHORTER than the 3-min stale
+// horizon — so under contention a waiter ran out of attempts before the live
+// holder released AND before the lock became reclaimable, throwing
+// `timed out after 40 attempts`. Staying patient past the stale horizon
+// guarantees forward progress: win when the holder releases, or reclaim once a
+// dead holder stops heartbeating.
 var LOCK_SHEET = '_lock';
-var STALE_LOCK_MS = 180000;       // 3 min — comfortably longer than one run's sheet work
-var LOCK_MAX_ATTEMPTS = 40;
+var STALE_LOCK_MS = 180000;            // 3 min with NO heartbeat ⇒ holder is dead → reclaim
+var LOCK_ACQUIRE_TIMEOUT_MS = 480000;  // 8 min patient wait (well inside the 30-min script cap)
+
+// uuid half of a `{uuid}@{ts}` lock cell (or '' for an empty/garbage cell).
+function lockUuidOf(cellValue) {
+  return String(cellValue || '').split('@')[0];
+}
 
 function acquireSheetLock(ss) {
   var meta = ss.getSheetByName(LOCK_SHEET) || ss.insertSheet(LOCK_SHEET);
   var cell = meta.getRange('A1');
-  var token = Utilities.getUuid() + '@' + (new Date().getTime());
-  for (var attempt = 0; attempt < LOCK_MAX_ATTEMPTS; attempt++) {
+  var uuid = Utilities.getUuid();
+  var startedAt = new Date().getTime();
+  var attempt = 0;
+  while (true) {
+    attempt++;
     var cur = String(cell.getValue() || '');
     var heldTs = cur ? Number(cur.split('@')[1] || 0) : 0;
-    if (cur === '' || (new Date().getTime() - heldTs) > STALE_LOCK_MS) {
-      cell.setValue(token);
+    var now = new Date().getTime();
+    if (cur === '' || (now - heldTs) > STALE_LOCK_MS) {
+      cell.setValue(uuid + '@' + now);
       SpreadsheetApp.flush();
       Utilities.sleep(250 + Math.floor(Math.random() * 500)); // let a racing CAS settle
-      if (String(cell.getValue()) === token) {
-        return token;                                          // we won the compare-and-set
+      if (lockUuidOf(cell.getValue()) === uuid) {
+        return uuid;                                           // we won the compare-and-set
       }
+    }
+    if ((new Date().getTime() - startedAt) > LOCK_ACQUIRE_TIMEOUT_MS) {
+      throw new Error('acquireSheetLock: gave up after ' + attempt + ' attempts / ' +
+        Math.round((new Date().getTime() - startedAt) / 1000) + 's (lock held by "' + cur + '")');
     }
     Utilities.sleep(1000 + Math.floor(Math.random() * 2000));  // contended — back off + retry
   }
-  throw new Error('acquireSheetLock: timed out after ' + LOCK_MAX_ATTEMPTS + ' attempts');
 }
 
-function releaseSheetLock(ss, token) {
-  if (!token) return;
+// Bump the heartbeat ts so a long-but-healthy hold isn't mistaken for abandoned.
+// Throws if we've lost ownership (a waiter reclaimed us — only possible if a
+// single write phase outran STALE_LOCK_MS), so we STOP writing immediately rather
+// than co-write over the reclaimer and corrupt rows.
+function refreshSheetLock(ss, uuid) {
+  if (!uuid) return;
   var meta = ss.getSheetByName(LOCK_SHEET);
   if (!meta) return;
   var cell = meta.getRange('A1');
-  if (String(cell.getValue()) === token) {
+  if (lockUuidOf(cell.getValue()) !== uuid) {
+    throw new Error('refreshSheetLock: lost ownership of ' + LOCK_SHEET +
+      '!A1 mid-run (reclaimed as stale) — aborting to avoid concurrent-write corruption.');
+  }
+  cell.setValue(uuid + '@' + (new Date().getTime()));
+  SpreadsheetApp.flush();
+}
+
+function releaseSheetLock(ss, uuid) {
+  if (!uuid) return;
+  var meta = ss.getSheetByName(LOCK_SHEET);
+  if (!meta) return;
+  var cell = meta.getRange('A1');
+  if (lockUuidOf(cell.getValue()) === uuid) {
     cell.clearContent();
     SpreadsheetApp.flush();
   }
