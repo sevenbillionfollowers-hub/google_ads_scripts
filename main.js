@@ -149,6 +149,34 @@ function runReports(ss) {
     { tab: CHANGE_EVENTS_TAB, headers: CHANGE_EVENT_HEADERS, keys: CHANGE_EVENT_KEY_COLS, rows: collectChangeEvents(ctx), expectTz: null }
   ];
 
+  // NOTHING TO WRITE ⇒ NEVER TAKE THE LOCK. The cost of the write phase is a
+  // function of the SHARED SHEET's size, not of this account's data: upsertRows
+  // scans the whole key-column prefix of every tab (measured 2026-09-02:
+  // 893,075 cells across the four tabs, 85% of it SearchTerms) before it looks
+  // at `newRows`. So an account with zero rows used to queue for the fleet-wide
+  // mutex and then hold it for ~25 s to write nothing — measured on account
+  // 971-477-6033, which has never produced a single row in any tab: 3 s of its
+  // own GAQL work, 246 s waiting for the lock, then a 17 s hold before it was
+  // stomped mid-run.
+  //
+  // Such accounts are invisible to every census the Sheet supports (they
+  // contribute no rows, so they appear in no tab and in no DB table), which is
+  // why the fleet's true lock demand was being under-counted.
+  //
+  // The ONLY thing a zero-row run still accomplishes is the retention prune,
+  // and that is fleet-shared housekeeping — 71-89 accounts with real rows do it
+  // every hour. The single degenerate case is an entirely idle fleet, which by
+  // definition has nothing to prune.
+  var hasWork = false;
+  for (var w = 0; w < batches.length; w++) {
+    if (batches[w].rows.length > 0) { hasWork = true; break; }
+  }
+  if (!hasWork) {
+    Logger.log('runReports → no rows in any tab; skipping the write phase entirely ' +
+      '(lock not acquired, retention prune left to accounts that have rows)');
+    return;
+  }
+
   // PHASE 2 — WRITE. All N accounts write to ONE shared spreadsheet on
   // independent hourly schedules. Serialize the write phase behind a
   // sheet-anchored mutex: a per-script LockService cannot help, because every
@@ -168,7 +196,7 @@ function runReports(ss) {
       refreshSheetLock(ss, lockUuid, true);
       var sheet = ss.getSheetByName(b.tab) || ss.insertSheet(b.tab);
       var headerWidth = ensureHeaders(sheet, b.headers);
-      ensureTextFormats(sheet, b.headers);
+      ensureTextFormats(ss, lockUuid, sheet, b.headers);
       upsertRows(ss, lockUuid, sheet, b.headers, headerWidth, b.keys, b.rows, ctx, b.expectTz);
     }
     // Final ownership assertion. Without it a reclaim during the LAST phase was
@@ -871,7 +899,7 @@ function ensureRowCapacity(sheet, neededLastRow, headers) {
 // Steady-state cost is ONE single-cell read per tab per run: sample the number
 // format of the last data row in the first pinned column, and only re-pin when
 // it isn't already '@'.
-function ensureTextFormats(sheet, headers) {
+function ensureTextFormats(ss, lockUuid, sheet, headers) {
   var maxRows = sheet.getMaxRows();
   if (maxRows < 2) return;
   // Probe a column this version ADDED, never one the previous version already
@@ -886,8 +914,35 @@ function ensureTextFormats(sheet, headers) {
   if (sentinel < 0) return;
   var probeRow = Math.max(2, Math.min(sheet.getLastRow(), maxRows));
   if (sheet.getRange(probeRow, sentinel + 1).getNumberFormat() === '@') return;
-  Logger.log(sheet.getName() + ': pinning text columns to plain-text format');
-  applyTextFormats(sheet, headers, 0, 2, maxRows);
+  Logger.log(sheet.getName() + ': pinning text columns to plain-text format (' +
+    (maxRows - 1) + ' rows, chunked)');
+  applyTextFormatsChunked(ss, lockUuid, sheet, headers, 0, 2, maxRows);
+}
+
+// Rows per setNumberFormat() call in the full-tab re-pin. This is the ONE
+// unbounded formatting op in the file and it sits inside the mutex, ahead of
+// upsertRows.
+//
+// Un-chunked it was the largest single operation any run could perform with NO
+// heartbeat inside it: on the live SearchTerms tab (2026-09-02) that is 8
+// pinned columns x ~96,500 rows = 772,144 cells in one call. A holder is
+// reclaimed as stale after STALE_LOCK_MS (4 min) WITHOUT A HEARTBEAT — not
+// after 4 min of no progress — so a single op that outruns that horizon hands
+// the lock to a waiter while the holder is still alive and still writing. That
+// is the precondition for the `lost ownership … (reclaimed as stale)` abort,
+// and it is the only operation in the run big enough to reach it on its own.
+var TEXT_FORMAT_CHUNK_ROWS = 10000;
+
+// applyTextFormats() over [fromRow, toRow] in bands, asserting + refreshing
+// lock ownership between bands. Ownership is re-checked BEFORE each band, so a
+// run that already lost the lock stops re-formatting a tab another account is
+// writing instead of finishing the whole pass first.
+function applyTextFormatsChunked(ss, lockUuid, sheet, headers, skipBefore, fromRow, toRow) {
+  for (var start = fromRow; start <= toRow; start += TEXT_FORMAT_CHUNK_ROWS) {
+    var end = Math.min(start + TEXT_FORMAT_CHUNK_ROWS - 1, toRow);
+    refreshSheetLock(ss, lockUuid, false);
+    applyTextFormats(sheet, headers, skipBefore, start, end);
+  }
 }
 
 // Apply `@` (plain text) format to any TEXT_FORMATTED_COLUMNS present at
@@ -1201,14 +1256,27 @@ function upsertRows(ss, lockUuid, sheet, headers, headerWidth, keyCols, newRows,
   // rule the Laravel sync applies when it upserts).
   var byKey = {};
   var order = [];
+  // Lowest `date` among the rows we are about to write. No sheet row older than
+  // this can share a key with an incoming row, because `date` is part of every
+  // key set — which is what lets scanIndex skip reading their key columns.
+  // Derived from the rows themselves rather than from ctx.dateRange so the
+  // claim is self-evident and cannot drift if the collectors ever widen.
+  var windowStart = null;
   for (var j = 0; j < newRows.length; j++) {
     newRows[j][dateCol] = toDateStr(newRows[j][dateCol], tz);
+    var nd = newRows[j][dateCol];
+    if (windowStart === null || nd < windowStart) windowStart = nd;
     var nk = makeKey(newRows[j], keyIdx);
     if (!byKey.hasOwnProperty(nk)) order.push(nk);
     byKey[nk] = newRows[j];
   }
+  // FAIL SAFE: the whole optimization rests on `date` being part of the key.
+  // All four key sets include it today; if one ever stops, fall back to the
+  // full-width scan rather than silently missing matches (which would append a
+  // duplicate every hour).
+  var dateIsKey = indexOfStr(keyCols, 'date') >= 0;
 
-  var scan = scanIndex(sheet, indexWidth, dateCol, acctCol, keyIdx, accountId, tz, ctx.pruneBefore);
+  var scan = scanIndex(sheet, indexWidth, dateCol, acctCol, keyIdx, accountId, tz, ctx.pruneBefore, dateIsKey, windowStart);
   var pruned = 0;
 
   if (scan.drop.length > 0) {
@@ -1221,7 +1289,7 @@ function upsertRows(ss, lockUuid, sheet, headers, headerWidth, keyCols, newRows,
     // Row numbers below every deletion have shifted; re-read the (now smaller)
     // key index rather than trying to arithmetically adjust them.
     refreshSheetLock(ss, lockUuid, false);
-    scan = scanIndex(sheet, indexWidth, dateCol, acctCol, keyIdx, accountId, tz, ctx.pruneBefore);
+    scan = scanIndex(sheet, indexWidth, dateCol, acctCol, keyIdx, accountId, tz, ctx.pruneBefore, dateIsKey, windowStart);
   }
 
   var pos = scan.pos;
@@ -1313,9 +1381,28 @@ function upsertRows(ss, lockUuid, sheet, headers, headerWidth, keyCols, newRows,
 //   pos  — key → sheet row number, for our account's surviving rows
 // Walks backwards so the LAST occurrence of a key is the one kept, matching the
 // last-wins rule the downstream sync uses.
-function scanIndex(sheet, indexWidth, dateCol, acctCol, keyIdx, accountId, tz, pruneBefore) {
+// Minimum cells a narrow first pass must save before it is worth the extra
+// round trips of the second pass. On the live tabs (2026-09-02) only
+// SearchTerms clears it — 94,518 rows x (8 - 3) = 472,590 cells saved, against
+// ~12 small range reads for this account's in-window rows. Campaigns (2,015),
+// ChangeEvents (5,019) and Keywords (64,860) stay on the single wide read,
+// where the second pass would cost more than it saves. Keywords crosses over on
+// its own once the tab passes ~40k rows.
+var TWO_PASS_MIN_CELLS_SAVED = 200000;
+
+function scanIndex(sheet, indexWidth, dateCol, acctCol, keyIdx, accountId, tz, pruneBefore, dateIsKey, windowStart) {
   var lastRow = sheet.getLastRow();
   if (lastRow < 2) return { drop: [], pos: {} };
+
+  // The prefix that carries date + account_id — everything the retention
+  // classification and the account filter need. The key columns beyond it are
+  // only needed for rows that can actually match an incoming key.
+  var narrowWidth = Math.max(dateCol, acctCol) + 1;
+  var saved = (lastRow - 1) * (indexWidth - narrowWidth);
+  if (dateIsKey && saved >= TWO_PASS_MIN_CELLS_SAVED) {
+    return scanIndexTwoPass(sheet, lastRow, indexWidth, narrowWidth, dateCol, acctCol,
+      keyIdx, accountId, tz, pruneBefore, windowStart);
+  }
 
   var index = sheet.getRange(2, 1, lastRow - 1, indexWidth).getValues();
   var drop = [];
@@ -1339,6 +1426,83 @@ function scanIndex(sheet, indexWidth, dateCol, acctCol, keyIdx, accountId, tz, p
   }
   drop.sort(function (a, b) { return a - b; });
   return { drop: drop, pos: pos };
+}
+
+// Same contract as scanIndex, in two reads instead of one wide one.
+//
+// PASS 1 reads only the date + account_id prefix of the whole tab. That is
+// everything the retention classification needs, and everything needed to tell
+// our rows from the other ~150 accounts' rows.
+//
+// PASS 2 reads the full key width for OUR rows only, and only those dated at or
+// after `windowStart` (the lowest date we are about to write). Rows older than
+// that cannot match an incoming key because `date` is part of every key set, so
+// their key columns are dead weight — measured on SearchTerms: 127 rows in ~12
+// blocks, against 94,518 rows read at full width before.
+//
+// DELIBERATE BEHAVIOUR CHANGE: duplicate keys are now garbage-collected only
+// within the write window, not across the whole tab. Out-of-window duplicates
+// survive until retention ages them out. Accepted because (a) a clean read of
+// the live tab on 2026-09-02 found zero duplicates across 94,518 rows, (b) the
+// only consumer already dedupes defensively before upserting
+// (GoogleAdsSyncStatsCommand, "Defensive dedupe by the Ads-Script's intended
+// uniqueness key"), and (c) an in-window duplicate — the kind an interleaved
+// write actually produces — is still dropped on the very next run.
+function scanIndexTwoPass(sheet, lastRow, indexWidth, narrowWidth, dateCol, acctCol,
+                          keyIdx, accountId, tz, pruneBefore, windowStart) {
+  var narrow = sheet.getRange(2, 1, lastRow - 1, narrowWidth).getValues();
+  var drop = [];
+  var mine = [];
+  for (var i = 0; i < narrow.length; i++) {
+    var rowNo = i + 2;
+    var d = toDateStr(narrow[i][dateCol], tz);
+    if (!DATE_RE.test(d) || d < pruneBefore) { drop.push(rowNo); continue; }
+    if (String(narrow[i][acctCol]) !== accountId) continue;
+    // windowStart === null means this tab has nothing to write this run — there
+    // is no key to match, so pass 2 is skipped entirely and only the retention
+    // classification above survives.
+    if (windowStart === null || d < windowStart) continue;
+    mine.push(rowNo);
+  }
+
+  var pos = {};
+  if (mine.length > 0) {
+    var blocks = groupContiguousRows(mine);
+    // Walk blocks and rows in DESCENDING order so the LAST occurrence of a key
+    // is the one kept and earlier ones are dropped — the same last-wins rule
+    // the wide scan applies by iterating its array backwards.
+    for (var b = blocks.length - 1; b >= 0; b--) {
+      var vals = sheet.getRange(blocks[b][0], 1, blocks[b][1], indexWidth).getValues();
+      for (var r = vals.length - 1; r >= 0; r--) {
+        var rn = blocks[b][0] + r;
+        // Normalize the date before keying, for the same reason the wide scan
+        // does: Sheets hands back a Date object for any cell that predates the
+        // '@' pin, and its stringification can never equal "2026-08-07".
+        vals[r][dateCol] = toDateStr(vals[r][dateCol], tz);
+        var k = makeKey(vals[r], keyIdx);
+        if (pos.hasOwnProperty(k)) { drop.push(rn); continue; }
+        pos[k] = rn;
+      }
+    }
+  }
+
+  drop.sort(function (a, b) { return a - b; });
+  return { drop: drop, pos: pos };
+}
+
+// Ascending row numbers → [[startRow, count], …] contiguous blocks.
+function groupContiguousRows(rows) {
+  var blocks = [];
+  var start = rows[0];
+  var prev = rows[0];
+  for (var i = 1; i < rows.length; i++) {
+    if (rows[i] === prev + 1) { prev = rows[i]; continue; }
+    blocks.push([start, prev - start + 1]);
+    start = rows[i];
+    prev = rows[i];
+  }
+  blocks.push([start, prev - start + 1]);
+  return blocks;
 }
 
 // Delete the given (ascending) row numbers as contiguous blocks, bottom-up so
