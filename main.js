@@ -1348,13 +1348,34 @@ function upsertRows(ss, lockUuid, sheet, headers, headerWidth, keyCols, newRows,
   // — this account's timezone. A mismatch means another account's write landed
   // on our rows; throw loudly so the run fails visibly instead of shipping a
   // contaminated row.
+  //
+  // Read-side cost control, WITHOUT weakening the assertion: it used to re-read
+  // every written block at FULL header width, one round trip each — on the
+  // measured account 12 round trips (7.2 s) inside the mutex, to look at two
+  // columns. Now it reads only as far as the columns it checks, and merges
+  // blocks whose gap is cheaper than the round trip it saves. Rows inside a
+  // merged gap belong to other accounts and are skipped by the `isWritten`
+  // filter; every row we actually wrote is still checked, exactly as before.
   if (written.length > 0) {
     SpreadsheetApp.flush();
     var tzCol = headers.indexOf('account_timezone');
-    for (var w = 0; w < written.length; w++) {
-      var back = sheet.getRange(written[w][0], 1, written[w][1], headers.length).getValues();
+    var checkWidth = Math.max(acctCol, tzCol) + 1;
+    var isWritten = {};
+    var writtenRows = [];
+    for (var wi = 0; wi < written.length; wi++) {
+      for (var wn = 0; wn < written[wi][1]; wn++) {
+        var wr = written[wi][0] + wn;
+        isWritten[wr] = true;
+        writtenRows.push(wr);
+      }
+    }
+    writtenRows.sort(function (a, b) { return a - b; });
+    var checkSpans = coalesceRowBlocks(groupContiguousRows(writtenRows), checkWidth);
+    for (var w = 0; w < checkSpans.length; w++) {
+      var back = sheet.getRange(checkSpans[w][0], 1, checkSpans[w][1], checkWidth).getValues();
       for (var i = 0; i < back.length; i++) {
-        var rowNo = written[w][0] + i;
+        var rowNo = checkSpans[w][0] + i;
+        if (!isWritten[rowNo]) continue;
         if (String(back[i][acctCol]) !== accountId) {
           throw new Error('upsertRows self-check FAILED on "' + name +
             '" row ' + rowNo + ': account_id="' + back[i][acctCol] +
@@ -1467,14 +1488,23 @@ function scanIndexTwoPass(sheet, lastRow, indexWidth, narrowWidth, dateCol, acct
 
   var pos = {};
   if (mine.length > 0) {
-    var blocks = groupContiguousRows(mine);
-    // Walk blocks and rows in DESCENDING order so the LAST occurrence of a key
+    // Membership set of the rows we own. Coalesced spans deliberately include
+    // rows belonging to OTHER accounts, and those must never reach makeKey():
+    // a foreign key landing in `pos` is harmless on its own (our incoming keys
+    // carry our account_id and could never match it), but a foreign DUPLICATE
+    // would push another account's row number into `drop` and delete it.
+    var isOurs = {};
+    for (var m = 0; m < mine.length; m++) isOurs[mine[m]] = true;
+
+    var spans = coalesceRowBlocks(groupContiguousRows(mine), indexWidth);
+    // Walk spans and rows in DESCENDING order so the LAST occurrence of a key
     // is the one kept and earlier ones are dropped — the same last-wins rule
     // the wide scan applies by iterating its array backwards.
-    for (var b = blocks.length - 1; b >= 0; b--) {
-      var vals = sheet.getRange(blocks[b][0], 1, blocks[b][1], indexWidth).getValues();
+    for (var b = spans.length - 1; b >= 0; b--) {
+      var vals = sheet.getRange(spans[b][0], 1, spans[b][1], indexWidth).getValues();
       for (var r = vals.length - 1; r >= 0; r--) {
-        var rn = blocks[b][0] + r;
+        var rn = spans[b][0] + r;
+        if (!isOurs[rn]) continue;
         // Normalize the date before keying, for the same reason the wide scan
         // does: Sheets hands back a Date object for any cell that predates the
         // '@' pin, and its stringification can never equal "2026-08-07".
@@ -1488,6 +1518,43 @@ function scanIndexTwoPass(sheet, lastRow, indexWidth, narrowWidth, dateCol, acct
 
   drop.sort(function (a, b) { return a - b; });
   return { drop: drop, pos: pos };
+}
+
+// Cost of ONE Sheets round trip, expressed in cells. Measured on the live doc
+// 2026-09-02 from account 371-906-0364's own log: the SearchTerms phase took
+// 33 s for a 283,554-cell narrow scan plus 4 round trips across each of 12
+// blocks ⇒ ~68,000 cells/s and ~0.60 s per round trip ⇒ ~40,000 cells.
+//
+// This is the number that makes block-wise reading pay or not pay, and getting
+// it wrong is what made the first cut of the two-pass scan a WASH: it saved
+// 472,590 cells (6.9 s) and spent one round trip per block (12 x 0.60 s =
+// 7.2 s). Break-even was 11.6 blocks against a fleet average of 12.1.
+var SHEET_ROUND_TRIP_CELLS = 40000;
+
+// Merge adjacent row blocks whose gap is cheaper to read than the round trip it
+// would save. READ PATHS ONLY — never use this to widen a setValues(), because
+// the rows inside a gap belong to OTHER accounts and writing over them is the
+// exact cross-account clobber the mutex exists to prevent. Callers must filter
+// the rows they actually own back out of the returned spans.
+//
+// On the measured account this collapses 12 blocks to 2: the gap histogram is
+// 1, 1, 2, 2, 13, 10, 5, 3, 938, 1613 and 8362 rows, so everything but the last
+// merges for 20,704 extra cells (0.3 s) in place of 10 round trips (6.0 s).
+function coalesceRowBlocks(blocks, width) {
+  if (blocks.length < 2) return blocks;
+  var out = [];
+  var cur = [blocks[0][0], blocks[0][1]];
+  for (var i = 1; i < blocks.length; i++) {
+    var gap = blocks[i][0] - (cur[0] + cur[1]);
+    if (gap * width < SHEET_ROUND_TRIP_CELLS) {
+      cur[1] = blocks[i][0] + blocks[i][1] - cur[0];
+    } else {
+      out.push(cur);
+      cur = [blocks[i][0], blocks[i][1]];
+    }
+  }
+  out.push(cur);
+  return out;
 }
 
 // Ascending row numbers → [[startRow, count], …] contiguous blocks.
