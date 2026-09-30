@@ -5,6 +5,16 @@ var SEARCH_TERMS_TAB  = 'SearchTerms';
 var KEYWORDS_TAB      = 'Keywords';
 var CHANGE_EVENTS_TAB = 'ChangeEvents';
 
+// The Campaigns tab alone re-reads a wider window than DATE_WINDOW_DAYS.
+// Imported (offline) conversions are credited to the CLICK date and can arrive
+// days after it, so a day that has already left a 3-day window keeps the
+// conversion count it had on its last read — an import three days late left a
+// whole day at 0. Campaign rows are cheap (one per campaign per day); the heavy
+// SearchTerms/Keywords tabs, the change log and the avg target CPA stay on
+// DATE_WINDOW_DAYS. Keep this at or below the consumer's 7-day lookback: rows
+// older than that are never read.
+var CAMPAIGN_DATE_WINDOW_DAYS = 7;
+
 // How many days of history each tab keeps. The ONLY consumer of this sheet is
 // the Laravel sync, which pushes `where A >= now-7days` down to gviz — it never
 // reads older rows (history lives in the DB). Before this constant existed the
@@ -39,9 +49,9 @@ var CAMPAIGN_HEADERS = [
   // the paired metrics.invalid_click_rate (invalid ÷ (invalid + valid) clicks).
   'invalid_clicks', 'invalid_click_rate',
   // metrics.average_target_cpa_micros — the traffic-weighted target CPA the bid
-  // strategy actually optimized toward over the write window (NOT the static
-  // `target_cpa` setting). Resolved by fetchCampaignAvgTargetCpa() as one
-  // window-aggregated value per campaign.
+  // strategy actually optimized toward over the DATE_WINDOW_DAYS window (NOT
+  // the static `target_cpa` setting). Resolved by fetchCampaignAvgTargetCpa()
+  // as one window-aggregated value per campaign.
   'avg_target_cpa'
 ];
 
@@ -118,6 +128,8 @@ function runReports(ss) {
     currencyCode: account.getCurrencyCode(),
     timezone:     account.getTimeZone(),
     dateRange:    dateRange,
+    // Campaigns tab only — see CAMPAIGN_DATE_WINDOW_DAYS. Same end date.
+    campaignDateRange: computeDateRange(CAMPAIGN_DATE_WINDOW_DAYS, account.getTimeZone()),
     // Everything older than this is deleted from every tab (see RETENTION_DAYS).
     pruneBefore:  addDays(dateRange.end, -(RETENTION_DAYS - 1)),
     // Resolved once instead of once per upsertRows call — it is a Sheets round
@@ -135,6 +147,7 @@ function runReports(ss) {
     'currency=' + ctx.currencyCode + ' ' +
     'tz=' + ctx.timezone + ' ' +
     'window=' + ctx.dateRange.start + '..' + ctx.dateRange.end + ' ' +
+    'campaigns=' + ctx.campaignDateRange.start + '..' + ctx.campaignDateRange.end + ' ' +
     'retention>=' + ctx.pruneBefore
   );
 
@@ -227,7 +240,7 @@ function fetchCampaignFinalUrls() {
   // `final_url`/`final_domain` and writes them on every upsert, so emitting a
   // blank would NULL the stored URL for every campaign in the account. Letting
   // the run die is the self-healing failure — the next hourly run re-pulls the
-  // whole 3-day window and the Sheet keeps its previous, correct values.
+  // whole campaign window and the Sheet keeps its previous, correct values.
   {
     var query =
       'SELECT ' +
@@ -518,7 +531,7 @@ function collectCampaigns(ctx) {
       'metrics.invalid_clicks, ' +
       'metrics.invalid_click_rate ' +
     'FROM campaign ' +
-    "WHERE segments.date BETWEEN '" + ctx.dateRange.start + "' AND '" + ctx.dateRange.end + "'";
+    "WHERE segments.date BETWEEN '" + ctx.campaignDateRange.start + "' AND '" + ctx.campaignDateRange.end + "'";
 
   var iter = AdsApp.search(query);
   var rows = [];
