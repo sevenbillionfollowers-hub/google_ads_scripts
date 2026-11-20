@@ -52,7 +52,13 @@ var CAMPAIGN_HEADERS = [
   // strategy actually optimized toward over the DATE_WINDOW_DAYS window (NOT
   // the static `target_cpa` setting). Resolved by fetchCampaignAvgTargetCpa()
   // as one window-aggregated value per campaign.
-  'avg_target_cpa'
+  'avg_target_cpa',
+  // Full location targeting as JSON — targeted + excluded locations with their
+  // names and target types (City / Province / Region / Country / Radius …) plus
+  // the "Location options" presence settings. Built by
+  // fetchCampaignGeoTargeting(); the Campaigns page renders it in the Geo modal.
+  // '' = the fetch failed this run (Laravel keeps the previous value).
+  'campaign_geo_targeting'
 ];
 
 var CAMPAIGN_KEY_COLS = ['account_id', 'campaign_id', 'date'];
@@ -137,6 +143,7 @@ function runReports(ss) {
     sheetTz:      ss.getSpreadsheetTimeZone(),
     campaignUrls: fetchCampaignFinalUrls(),
     campaignGeo:  fetchCampaignGeoTargets(),
+    geoTargeting: fetchCampaignGeoTargeting(),
     conversionGoals: fetchCampaignConversionGoals(),
     avgTargetCpa: fetchCampaignAvgTargetCpa(dateRange),
     runTimestamp: new Date().toISOString()
@@ -399,6 +406,219 @@ function resolveGeoTargetCountryCodes(resourceNames) {
   return out;
 }
 
+// Full location targeting per campaign, for the Campaigns page's Geo modal →
+// { byCampaign: { campaignId: {
+//     targets:  [{ id, name, canonical, type, country }],   // positive criteria
+//     excluded: [{ id, name, canonical, type, country }],   // negative criteria
+//     targets_more / excluded_more: n,                      // only when capped
+//     positive_type: 'PRESENCE_OR_INTEREST' | 'PRESENCE' | '',
+//     negative_type: 'PRESENCE' | 'PRESENCE_OR_INTEREST' | ''
+// } }, cells: {} }, or null when the criteria query failed.
+//
+// Kept separate from fetchCampaignGeoTargets() so a failure here can never
+// blank campaign_geo, which the geo-mismatch warning and offer routing read.
+//
+// PROXIMITY (radius) and LOCATION_GROUP criteria are read alongside LOCATION:
+// a campaign targeted only by a radius has no LOCATION criteria, and reading it
+// as "no criteria" would make the modal claim it serves everywhere.
+//
+// The Location options query is optional — if it fails, the presence settings
+// stay blank but the location lists still ship.
+var GEO_TARGETING_MAX_ITEMS = 150;
+
+function fetchCampaignGeoTargeting() {
+  var byCampaign = {};
+  var entryFor = function (cid) {
+    if (!byCampaign[cid]) {
+      byCampaign[cid] = { targets: [], excluded: [], positive_type: '', negative_type: '' };
+    }
+    return byCampaign[cid];
+  };
+
+  var pending = [];   // LOCATION criteria waiting for their geo_target_constant name
+  try {
+    var critQuery =
+      'SELECT ' +
+        'campaign.id, ' +
+        'campaign_criterion.criterion_id, ' +
+        'campaign_criterion.type, ' +
+        'campaign_criterion.status, ' +
+        'campaign_criterion.negative, ' +
+        'campaign_criterion.location.geo_target_constant, ' +
+        'campaign_criterion.proximity.radius, ' +
+        'campaign_criterion.proximity.radius_units, ' +
+        'campaign_criterion.proximity.address.street_address, ' +
+        'campaign_criterion.proximity.address.city_name, ' +
+        'campaign_criterion.proximity.address.province_name, ' +
+        'campaign_criterion.proximity.address.country_code, ' +
+        'campaign_criterion.proximity.geo_point.latitude_in_micro_degrees, ' +
+        'campaign_criterion.proximity.geo_point.longitude_in_micro_degrees ' +
+      'FROM campaign_criterion ' +
+      "WHERE campaign_criterion.type IN ('LOCATION', 'PROXIMITY', 'LOCATION_GROUP') " +
+        "AND campaign.status != 'REMOVED'";
+
+    var it = AdsApp.search(critQuery);
+    while (it.hasNext()) {
+      var r = it.next();
+      var crit = r.campaignCriterion || {};
+      if (crit.status === 'REMOVED') continue;
+      var cid = String(r.campaign.id);
+      var negative = crit.negative === true;
+      var type = String(crit.type || '');
+      if (type === 'LOCATION') {
+        var gtc = crit.location && crit.location.geoTargetConstant;
+        if (!gtc) continue;
+        entryFor(cid);
+        pending.push({ cid: cid, negative: negative, gtc: String(gtc) });
+      } else if (type === 'PROXIMITY') {
+        pushGeoTargetingItem(entryFor(cid), negative, proximityTargetingItem(crit));
+      } else if (type === 'LOCATION_GROUP') {
+        pushGeoTargetingItem(entryFor(cid), negative, {
+          id: String(crit.criterionId || ''), name: 'Location group',
+          canonical: '', type: 'Location group', country: ''
+        });
+      }
+    }
+
+    var uniqueGtc = {};
+    for (var p = 0; p < pending.length; p++) uniqueGtc[pending[p].gtc] = true;
+    var details = resolveGeoTargetConstantDetails(Object.keys(uniqueGtc));
+    for (var q = 0; q < pending.length; q++) {
+      var pend = pending[q];
+      var parts = pend.gtc.split('/');
+      var gid = parts[parts.length - 1];
+      // A constant that no longer resolves (retired by Google) still shows up,
+      // by id, rather than silently vanishing from the list.
+      pushGeoTargetingItem(entryFor(pend.cid), pend.negative, details[pend.gtc] ||
+        { id: gid, name: 'Location ' + gid, canonical: '', type: '', country: '' });
+    }
+  } catch (e) {
+    Logger.log('fetchCampaignGeoTargeting failed (leaving campaign_geo_targeting blank): ' + e);
+    return null;
+  }
+
+  try {
+    var settingQuery =
+      'SELECT ' +
+        'campaign.id, ' +
+        'campaign.geo_target_type_setting.positive_geo_target_type, ' +
+        'campaign.geo_target_type_setting.negative_geo_target_type ' +
+      'FROM campaign ' +
+      "WHERE campaign.status != 'REMOVED'";
+    var sit = AdsApp.search(settingQuery);
+    while (sit.hasNext()) {
+      var s = sit.next();
+      var setting = (s.campaign && s.campaign.geoTargetTypeSetting) || {};
+      var entry = entryFor(String(s.campaign.id));
+      entry.positive_type = normEnumToken(setting.positiveGeoTargetType);
+      entry.negative_type = normEnumToken(setting.negativeGeoTargetType);
+    }
+  } catch (e2) {
+    Logger.log('fetchCampaignGeoTargeting: location options query failed (presence settings left blank): ' + e2);
+  }
+
+  Logger.log('Campaign geo targeting resolved: ' + Object.keys(byCampaign).length + ' campaigns');
+  return { byCampaign: byCampaign, cells: {} };
+}
+
+function pushGeoTargetingItem(entry, negative, item) {
+  var list = negative ? entry.excluded : entry.targets;
+  if (list.length < GEO_TARGETING_MAX_ITEMS) {
+    list.push(item);
+    return;
+  }
+  var moreKey = negative ? 'excluded_more' : 'targets_more';
+  entry[moreKey] = (entry[moreKey] || 0) + 1;
+}
+
+// A radius criterion as a display item: "20 km around Montreal".
+function proximityTargetingItem(crit) {
+  var p = crit.proximity || {};
+  var addr = p.address || {};
+  var gp = p.geoPoint || {};
+  var coords = '';
+  if (gp.latitudeInMicroDegrees !== undefined && gp.latitudeInMicroDegrees !== null &&
+      gp.longitudeInMicroDegrees !== undefined && gp.longitudeInMicroDegrees !== null) {
+    coords = (Number(gp.latitudeInMicroDegrees) / 1e6).toFixed(4) + ', ' +
+             (Number(gp.longitudeInMicroDegrees) / 1e6).toFixed(4);
+  }
+  var addrParts = [];
+  if (addr.streetAddress) addrParts.push(String(addr.streetAddress));
+  if (addr.cityName) addrParts.push(String(addr.cityName));
+  if (addr.provinceName) addrParts.push(String(addr.provinceName));
+  if (addr.countryCode) addrParts.push(String(addr.countryCode).toUpperCase());
+
+  var radius = Number(p.radius || 0);
+  var units = p.radiusUnits === 'MILES' ? 'mi' : 'km';
+  var place = addr.cityName || addr.streetAddress || coords || 'a pin';
+  return {
+    id: String(crit.criterionId || ''),
+    name: (radius > 0 ? radius + ' ' + units + ' around ' : 'Radius around ') + place,
+    canonical: addrParts.length ? addrParts.join(', ') : coords,
+    type: 'Radius',
+    country: addr.countryCode ? String(addr.countryCode).toUpperCase() : ''
+  };
+}
+
+// geo_target_constant resource names → { name, canonical, type, country } items
+// keyed by resource name. Same id-chunked lookup as resolveGeoTargetCountryCodes,
+// with the display fields added.
+function resolveGeoTargetConstantDetails(resourceNames) {
+  var out = {};
+  var ids = [];
+  var resourceById = {};
+  for (var i = 0; i < resourceNames.length; i++) {
+    var rn = String(resourceNames[i]);
+    var parts = rn.split('/');
+    var id = parts[parts.length - 1];
+    if (id) {
+      ids.push(id);
+      resourceById[id] = rn;
+    }
+  }
+
+  var CHUNK = 500;
+  for (var k = 0; k < ids.length; k += CHUNK) {
+    var q =
+      'SELECT ' +
+        'geo_target_constant.id, ' +
+        'geo_target_constant.name, ' +
+        'geo_target_constant.canonical_name, ' +
+        'geo_target_constant.target_type, ' +
+        'geo_target_constant.country_code ' +
+      'FROM geo_target_constant ' +
+      'WHERE geo_target_constant.id IN (' + ids.slice(k, k + CHUNK).join(', ') + ')';
+    var it = AdsApp.search(q);
+    while (it.hasNext()) {
+      var g = it.next().geoTargetConstant || {};
+      var gid = (g.id !== null && g.id !== undefined) ? String(g.id) : null;
+      if (!gid || !resourceById[gid]) continue;
+      out[resourceById[gid]] = {
+        id: gid,
+        name: String(g.name || ('Location ' + gid)),
+        canonical: String(g.canonicalName || ''),
+        type: String(g.targetType || ''),
+        country: g.countryCode ? String(g.countryCode).toUpperCase() : ''
+      };
+    }
+  }
+  return out;
+}
+
+// The campaign_geo_targeting cell for one campaign. '' when the fetch failed
+// (Laravel keeps the stored value); a campaign the criteria query returned
+// nothing for serializes with empty lists = "all countries and territories".
+// Memoized: collectCampaigns emits one row per campaign per day.
+function geoTargetingCell(geo, campaignId) {
+  if (!geo) return '';
+  var cid = String(campaignId);
+  if (geo.cells[cid] === undefined) {
+    geo.cells[cid] = JSON.stringify(geo.byCampaign[cid] ||
+      { targets: [], excluded: [], positive_type: '', negative_type: '' });
+  }
+  return geo.cells[cid];
+}
+
 // Resolve each campaign's conversion goals → { campaignId: [{category, origin,
 // biddable}, …] }. `campaign_conversion_goal` is an attributes-only resource
 // (no metrics, no date segmentation) — it lists which conversion-goal
@@ -589,7 +809,8 @@ function collectCampaigns(ctx) {
       Number(r.metrics.invalidClickRate || 0),
       // Window-aggregated avg target CPA (same value on every day-row for a
       // campaign; the Laravel sync collapses to one parent row per campaign).
-      ctx.avgTargetCpa[r.campaign.id] || ''
+      ctx.avgTargetCpa[r.campaign.id] || '',
+      geoTargetingCell(ctx.geoTargeting, r.campaign.id)
     ]);
   }
 
@@ -812,7 +1033,7 @@ var TEXT_FORMATTED_COLUMNS = [
   'date', 'last_updated', 'change_date_time',
   'account_id', 'account_name', 'campaign_name', 'ad_group_name',
   'keyword', 'search_term', 'final_url', 'user_email',
-  'primary_status_reasons', 'conversion_goals',
+  'primary_status_reasons', 'conversion_goals', 'campaign_geo_targeting',
   'change_event_resource_name', 'changed_resource_name',
   'campaign_resource_name', 'ad_group_resource_name',
   'changed_fields_json', 'old_resource_json', 'new_resource_json'
@@ -827,7 +1048,7 @@ var GRID_ROW_SLACK = 2000;
 
 // Returns the effective header width so upsertRows doesn't have to re-read it.
 function ensureHeaders(sheet, headers) {
-  // A fresh insertSheet() has 26 columns and CAMPAIGN_HEADERS is 31 wide — the
+  // A fresh insertSheet() has 26 columns and CAMPAIGN_HEADERS is 32 wide — the
   // header write itself used to throw "out of bounds" on a regenerated tab,
   // which is exactly what the "Delete the tab and re-run" error below tells an
   // operator to do.
